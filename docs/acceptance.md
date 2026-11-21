@@ -87,6 +87,7 @@ timings and repeat under competing writers before tuning the batch limit.
 
 ## Usefulness pilot
 
-The [pilot protocol](pilot.md) records the four measures in plan section 13.1.
-It requires at least two weeks of normal work in a real repository and human
+The usefulness evaluation from plan section 13.1 is tracked in
+[issue #13](https://github.com/andikapradanaarif/epocNote/issues/13). It
+requires at least two weeks of normal work in a real repository and human
 review of a sample of searches and notes.
