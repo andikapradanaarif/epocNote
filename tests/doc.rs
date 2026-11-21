@@ -282,6 +282,6 @@ fn trailing_content_after_mapping_is_malformed() {
     let src = "---\ntitle: x\nkind: note\nscope: global\n---\njunk after\n";
     // Trailing content after a complete mapping makes the block malformed.
     let src2 = "---\ntitle: x\nkind: note\nscope: global\ntrailing: [unclosed\n---\nbody\n";
-    assert!(analyze(src, ".context/notes/t.md").malformed_frontmatter == false);
-    assert!(analyze(src2, ".context/notes/t.md").malformed_frontmatter == true);
+    assert!(!analyze(src, ".context/notes/t.md").malformed_frontmatter);
+    assert!(analyze(src2, ".context/notes/t.md").malformed_frontmatter);
 }
