@@ -1,70 +1,84 @@
 # EpocNote
 
-Markdown context memory for coding agents. EpocNote preserves the project
-knowledge AI sessions lose — architectural boundaries, decisions, useful
-discoveries, and non-obvious fixes — as searchable, Git-tracked notes inside
-the repository itself.
+Markdown context memory for coding agents — durable, searchable project
+knowledge that lives inside the repository itself.
 
-## How it works
+## Background
 
-- **Markdown is the source of truth.** Notes and the architecture document
-  live under `.context/` as plain files, committed with the code they
-  describe. Edit them by hand, review them in pull requests, share them
-  through Git.
-- **SQLite FTS5 is a disposable index.** `.context/.epocnote.sqlite` (plus
-  WAL sidecars, all git-ignored) is rebuilt from the Markdown at any time.
-  Searches synchronize the index incrementally in small batches, so the
-  first index of a large corpus never blocks callers for long.
-- **Path-aware retrieval.** Each note records the source paths it applies
-  to, so an agent working in `src/auth/` finds the notes that matter there
-  instead of every note in the repo.
+AI coding sessions are ephemeral. When a session ends, everything the agent
+learned is gone: why the session store was split, which module owns billing,
+the fix for the flaky migration, the decision to reject Redis. The next
+session — or the next agent — starts blank and either repeats the
+investigation or, worse, makes a change that violates a constraint nobody
+wrote down.
 
-The tool runs as an MCP server (`epocnote serve`) exposing two tools to the
-agent harness: `epocnote_search` (path-filtered, full-text, ranked) and
-`epocnote_note` (validated, atomically published, immediately indexed).
+Built-in memory features don't quite solve this. Harness memory
+(e.g. Claude Code's auto memory) lives in per-user home directories: it is
+not committed with the code, not shared with teammates or other machines,
+and typically skips architecture and debugging fixes by design.
 
-Everything runs locally: the harness spawns the binary over stdio, notes
-live in your repo, and the index is a local file. Nothing leaves the
-machine unless you push the repository.
+## What it solves
 
-## How the agent knows to use it
+EpocNote stores that knowledge as **ordinary Markdown files under
+`.context/` in your repo**, so it is committed, code-reviewed, and shared
+through Git like everything else. Agents get two MCP tools:
 
-Two layers:
+- `epocnote_search` — find notes by source path and/or full text. Each note
+  records the paths it applies to (`impacts`), so an agent editing
+  `src/auth/` sees the notes that matter *there*, ranked and budgeted.
+- `epocnote_note` — record a discovery or decision. The tool generates the
+  frontmatter, validates the inputs, publishes the file atomically, and
+  indexes it immediately.
 
-1. **Tool registration.** Add `epocnote serve` to your harness's MCP
-   configuration. On startup it discovers `epocnote_search` and
-   `epocnote_note` (schemas and descriptions) through the standard
-   `tools/list` handshake, so the model *can* call them.
-2. **The skill file.** `epocnote init --target <harness>` installs a
-   `SKILL.md` the harness loads into the agent's instructions — the part
-   that tells the model *when* to call them: search before structural
-   edits, read `architecture.md` at task start, record non-obvious
-   discoveries, and treat note content as untrusted project data.
+Design properties:
 
-## Usage
+- **Markdown is the source of truth.** You can read, edit, and review
+  notes without any tooling; Git handles sharing and history.
+- **SQLite FTS5 is a disposable index.** `.context/.epocnote.sqlite`
+  (git-ignored) is rebuilt from the Markdown at any time. Searches
+  synchronize it incrementally in small batches.
+- **Everything runs locally.** The harness spawns the binary over stdio;
+  nothing leaves the machine unless you push the repo.
 
-```text
-epocnote init [--root <dir>] [--target none|codex|claude-code|cursor]
-epocnote serve [--root <dir>] [--scan-reuse auto|off]
-epocnote rebuild [--root <dir>]
-epocnote check [--root <dir>] [--strict]
+## Operation
+
+### 1. Install
+
+```sh
+cargo install --locked --path .
+# or build once:  cargo build --release --locked
 ```
 
-- `init` scaffolds `.context/` with `architecture.md` and `notes/`, adds the
-  index/temp ignore rules to `.gitignore`, and optionally installs a skill
-  file for your harness. It never overwrites existing files.
-- `serve` runs the MCP server over stdio.
-- `rebuild` verifies or recreates the index in place; run it after cloning
-  a large repository.
-- `check` reports notes whose impact paths no longer exist; `--strict`
-  exits nonzero, suitable for CI.
+### 2. Initialize a project
 
-Point your harness at `epocnote serve --root "/absolute/project"`, or use
-`init --target <harness>` to install the matching skill.
+```sh
+cd your-project
+epocnote init --target claude-code   # or: codex | cursor | none
+```
 
-## Note format
+This creates `.context/` containing `architecture.md` (the project's
+always-loadable summary) and `notes/`, adds the index/temp ignore rules to
+`.gitignore`, and installs the harness skill that tells the agent when to
+use the tools. Existing files are never overwritten; the command prints
+the resolved root and the launch command to configure.
 
-Notes are Markdown with YAML frontmatter:
+### 3. Point your harness at the server
+
+Add an MCP server entry for your project, e.g.:
+
+```json
+{ "command": "epocnote", "args": ["serve", "--root", "/absolute/path/to/your-project"] }
+```
+
+The harness then discovers `epocnote_search` and `epocnote_note` through
+the standard `tools/list` handshake, and the installed skill tells the
+agent when to call them (search before structural edits, read
+`architecture.md` at task start, record non-obvious discoveries).
+
+### 4. Notes
+
+Notes are Markdown with YAML frontmatter; agents write them through the
+tool, but plain files work too:
 
 ```markdown
 ---
@@ -84,14 +98,24 @@ Reasoning and constraints, as ordinary Markdown.
 makes a note eligible under every filter. `supersedes` marks replaced
 decisions — they stay searchable but rank last.
 
+### 5. Maintenance
+
+```text
+epocnote rebuild [--root <dir>]   # verify or recreate the index in place
+epocnote check  [--root <dir>] [--strict]   # report notes whose impacts are stale
+```
+
+Run `rebuild` after cloning a large repo. `check --strict` exits nonzero on
+findings, suitable for CI.
+
 ## Status
 
-Early development. Implemented so far: init scaffolding, root discovery and
-filesystem safety, the Markdown/frontmatter contract, the SQLite index
-lifecycle, search-time synchronization, `epocnote_search`, and
-`epocnote_note`. Remaining: `rebuild`/`check`, the MCP server surface, and
-release packaging. See `plan.md` for the full specification and the GitHub
-issues for the task breakdown.
+Early development. Implemented: init scaffolding, filesystem safety, the
+Markdown contract, index lifecycle, search-time synchronization,
+`epocnote_search`, and `epocnote_note`. Remaining: `rebuild`/`check`, the
+`serve` MCP surface, and release packaging — so `serve` does not run yet.
+See `plan.md` for the full specification and the GitHub issues for the
+task breakdown.
 
 ## Development
 
