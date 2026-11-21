@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use epocnote::init::{self, Target};
+use epocnote::sync::ScanReuse;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -61,12 +62,6 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
-}
-
-#[derive(Clone, clap::ValueEnum)]
-enum ScanReuse {
-    Auto,
-    Off,
 }
 
 fn main() -> ExitCode {

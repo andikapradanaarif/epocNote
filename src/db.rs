@@ -49,6 +49,10 @@ impl Index {
         &self.conn
     }
 
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     /// Confirm the database path still names the file this connection opened
     /// (device + file identity). When the file was replaced — for example a
     /// recreated `.context/` — close the stale connection and reopen against

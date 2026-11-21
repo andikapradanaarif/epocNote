@@ -274,6 +274,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "saphyr-parser",
+ "sha2",
  "tempfile",
  "tokio",
 ]

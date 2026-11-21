@@ -6,6 +6,7 @@ pub mod error;
 pub mod init;
 pub mod root;
 pub mod scan;
+pub mod sync;
 
 // Pinned per plan.md section 1.3; used by the index and server in later work.
 use rmcp as _;
