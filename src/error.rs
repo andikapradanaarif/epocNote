@@ -83,9 +83,10 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Warning {
     pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub message: String,
 }
