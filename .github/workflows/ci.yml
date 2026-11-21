@@ -3,38 +3,120 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '15.0'
 
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - &linux
+            os: ubuntu-24.04
+            platform: linux-x86_64
+            executable: epocnote
+            minimum_os: Ubuntu 24.04
+          - &mac_arm
+            os: macos-15
+            platform: macos-arm64
+            executable: epocnote
+            minimum_os: macOS 15
+          - &mac_intel
+            os: macos-15-intel
+            platform: macos-x86_64
+            executable: epocnote
+            minimum_os: macOS 15
+          - &windows
+            os: windows-2022
+            platform: windows-x86_64
+            executable: epocnote.exe
+            minimum_os: Windows Server 2022
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      # rustup reads rust-toolchain.toml from the repo and installs the pinned
-      # toolchain automatically; `rustup show` materializes it before cargo runs.
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
       - name: Install toolchain
         run: |
           rustup show
           rustup component add rustfmt clippy
-
       - name: Format
         run: cargo fmt --all -- --check
-
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-
-      # The test suite creates the FTS5 schema and executes the actual bm25
-      # ranking query against the bundled SQLite on every release target
-      # (plan.md sections 1.3 and 13).
       - name: Test
         run: cargo test --locked
-
       - name: Release build
         run: cargo build --release --locked
+      - name: Release retrieval and MCP
+        run: cargo test --locked --release --test search --test mcp
+      - name: Record bundled SQLite
+        shell: bash
+        run: |
+          cargo test --locked --release --lib bundled_engine_version_and_options -- --nocapture 2>&1 | tee sqlite-engine.txt
+      - name: Package native release build
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          EXECUTABLE: ${{ matrix.executable }}
+          MINIMUM_OS: ${{ matrix.minimum_os }}
+          BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          python scripts/package.py build --binary "target/release/$EXECUTABLE" --engine sqlite-engine.txt --platform "$PLATFORM" --minimum-os "$MINIMUM_OS" --commit "$BUILD_COMMIT" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epocnote-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  verify-package:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - *linux
+          - *mac_arm
+          - *mac_intel
+          - *windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: epocnote-${{ matrix.platform }}
+          path: dist
+      - name: Verify packaged binary on fresh runner
+        run: python scripts/package.py verify dist
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: epocnote-*
+          path: dist
+          merge-multiple: true
+      - name: Create a draft release from verified packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes dist/*

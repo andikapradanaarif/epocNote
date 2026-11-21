@@ -77,7 +77,7 @@ fn visit(
         let md = fs::symlink_metadata(child.path())?;
         let is_utf8 = parent_is_utf8 && name.to_str().is_some();
 
-        if md.file_type().is_symlink() {
+        if crate::root::is_redirected(&md) {
             out.push(entry(rel, EntryKind::Skip(SkipReason::Symlink)));
             continue;
         }
@@ -147,14 +147,16 @@ pub(crate) fn is_candidate(root: &Path, path: &str) -> io::Result<bool> {
     // cannot make its old descendants appear to have come back.
     for (end, _) in path.match_indices('/') {
         match fs::symlink_metadata(root.join(&path[..end])) {
-            Ok(md) if md.is_dir() => {}
+            Ok(md) if md.is_dir() && !crate::root::is_redirected(&md) => {}
             Ok(_) => return Ok(false),
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
         }
     }
     match fs::symlink_metadata(root.join(path)) {
-        Ok(md) => Ok(md.is_file() && md.len() <= MAX_SOURCE_BYTES),
+        Ok(md) => {
+            Ok(md.is_file() && !crate::root::is_redirected(&md) && md.len() <= MAX_SOURCE_BYTES)
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
@@ -218,7 +220,7 @@ pub fn stable_read(path: &Path, cap: u64) -> io::Result<ReadOutcome> {
     };
 
     let before = file.metadata()?;
-    if !before.is_file() {
+    if !before.is_file() || crate::root::is_redirected(&before) {
         return Ok(ReadOutcome::NotRegular);
     }
     if before.len() > cap {
@@ -256,9 +258,12 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
 
 #[cfg(windows)]
 fn open_nofollow(path: &Path) -> io::Result<File> {
-    // Windows has no O_NOFOLLOW; junction-type redirections are already
-    // excluded at the symlink_metadata stage before this open.
-    File::open(path)
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 #[cfg(all(not(unix), not(windows)))]

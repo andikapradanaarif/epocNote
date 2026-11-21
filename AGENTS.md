@@ -28,8 +28,8 @@ dependencies to exact versions that are at least 7 days old.
 
 ## Layout
 
-- `src/` — library modules; `main.rs` implements `init`, `rebuild`, and
-  `check`. `serve` is a stub.
+- `src/main.rs` — CLI entry point for `init`, `serve`, `rebuild`, and `check`.
+- `src/server.rs` — stdio MCP lifecycle and tool dispatch.
 - `src/root.rs`, `src/canon.rs`, `src/scan.rs` — root discovery, canonical
   paths, no-follow filesystem scan/read rules.
 - `src/db.rs`, `src/sync.rs` — SQLite lifecycle, search-time

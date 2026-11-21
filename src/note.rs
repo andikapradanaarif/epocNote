@@ -26,11 +26,14 @@ pub struct NoteInput {
     pub title: String,
     pub body: String,
     pub impacts: Vec<String>,
+    #[serde(default, deserialize_with = "crate::error::present")]
     pub kind: Option<String>,
+    #[serde(default, deserialize_with = "crate::error::present")]
     pub supersedes: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct NoteOutput {
     pub path: String,
     pub saved: bool,
@@ -39,7 +42,7 @@ pub struct NoteOutput {
     pub warnings_truncated: bool,
 }
 
-struct Parsed {
+pub(crate) struct Parsed {
     title: String,
     body: String,
     impacts: Vec<CanonPath>,
@@ -51,7 +54,7 @@ fn invalid(msg: impl Into<String>) -> Error {
     Error::InvalidArgument(msg.into())
 }
 
-fn validate(input: NoteInput) -> Result<Parsed, Error> {
+pub(crate) fn validate(input: NoteInput) -> Result<Parsed, Error> {
     // Newlines and control characters are rejected anywhere in the raw
     // title, including a trailing newline that trimming would erase.
     if input
@@ -64,7 +67,7 @@ fn validate(input: NoteInput) -> Result<Parsed, Error> {
         ));
     }
     let title = input.title.trim();
-    if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
+    if title.is_empty() || input.title.chars().count() > MAX_TITLE_CHARS {
         return Err(invalid("title must be nonempty and at most 200 characters"));
     }
     // Normalize CRLF and lone CR before the size check (9.1).
@@ -125,14 +128,12 @@ fn check_supersedes(root: &Path, parsed: &Parsed) -> Result<(), Error> {
                 "supersedes target {s:?} is not a context document"
             )));
         }
-        let abs = root.join(s);
-        match (inspect_impact(root, c), fs::symlink_metadata(&abs)) {
-            (ImpactTarget::Exists, Ok(md)) if md.is_file() => {}
-            _ => {
-                return Err(invalid(format!(
-                    "supersedes target {s:?} is not an existing regular context document"
-                )));
-            }
+        if inspect_impact(root, c) != ImpactTarget::Exists
+            || !fs::symlink_metadata(root.join(s)).is_ok_and(|md| md.is_file())
+        {
+            return Err(invalid(format!(
+                "supersedes target {s:?} is not an existing regular context document"
+            )));
         }
     }
     Ok(())
@@ -160,9 +161,13 @@ fn document(parsed: &Parsed, created_at: &str) -> String {
     out.push_str(&format!("kind: {}\n", parsed.kind));
     out.push_str("scope: paths\n");
     out.push_str(&format!("created_at: {}\n", yaml_string(created_at)));
-    out.push_str("impacts:\n");
-    for c in &parsed.impacts {
-        out.push_str(&format!("  - {}\n", yaml_string(c.as_str())));
+    if parsed.impacts.is_empty() {
+        out.push_str("impacts: []\n");
+    } else {
+        out.push_str("impacts:\n");
+        for c in &parsed.impacts {
+            out.push_str(&format!("  - {}\n", yaml_string(c.as_str())));
+        }
     }
     if !parsed.supersedes.is_empty() {
         out.push_str("supersedes:\n");
@@ -218,13 +223,15 @@ fn publish(
     slug: &str,
     bytes: &[u8],
     date: &str,
+    cancelled: impl Fn() -> bool,
+    mut random_suffix: impl FnMut() -> Result<String, Error>,
 ) -> Result<(String, Vec<Warning>), Error> {
     let dir = notes_dir(root);
     // The publication directory must be a real directory beneath a real
     // .context — a symlink here would publish outside the project (3.2).
     for d in [&root.join(".context"), &dir] {
         match fs::symlink_metadata(d) {
-            Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
+            Ok(md) if md.is_dir() && !crate::root::is_redirected(&md) => {}
             Ok(_) => {
                 return Err(Error::UnsafePath(format!(
                     "{} is not a real directory",
@@ -235,16 +242,22 @@ fn publish(
         }
     }
     for _ in 0..MAX_PUBLISH_ATTEMPTS {
-        let suffix = random_hex()?;
-        let tmp = dir.join(format!(".epocnote-tmp-{}", random_hex()?));
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let suffix = random_suffix()?;
+        let tmp = dir.join(format!(".epocnote-tmp-{}", random_suffix()?));
         let dest_name = format!("{date}-{slug}-{suffix}.md");
         let dest = dir.join(&dest_name);
         {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(Error::Io)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&tmp).map_err(Error::Io)?;
             let r = f
                 .write_all(bytes)
                 .and_then(|()| f.sync_all())
@@ -254,23 +267,30 @@ fn publish(
                 return Err(e);
             }
         }
+        if cancelled() {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Cancelled);
+        }
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
                 let path = format!(".context/notes/{dest_name}");
                 let mut warnings = Vec::new();
-                if let Err(e) = sync_dir(&dir) {
-                    warnings.push(Warning::new(
-                        "DURABILITY",
-                        Some(path.clone()),
-                        format!("note saved but the directory could not be synchronized: {e}"),
-                    ));
-                }
                 if let Err(e) = fs::remove_file(&tmp) {
                     warnings.push(Warning::new(
                         "CLEANUP_FAILED",
                         Some(path.clone()),
                         format!("note saved; could not remove its temporary file: {e}"),
                     ));
+                }
+                if let Err(e) = sync_dir(&dir) {
+                    warnings.insert(
+                        0,
+                        Warning::new(
+                            "DURABILITY",
+                            Some(path.clone()),
+                            format!("note saved but the directory could not be synchronized: {e}"),
+                        ),
+                    );
                 }
                 return Ok((path, warnings));
             }
@@ -307,7 +327,7 @@ fn sync_dir(_dir: &Path) -> Result<(), Error> {
 /// transaction. `indexed: true` only when a committed row carries the
 /// publication hash — never substitute content that arrived after
 /// publication.
-fn index_published(
+pub(crate) fn index_published(
     index: &mut Index,
     root: &Path,
     path: &str,
@@ -327,27 +347,23 @@ fn index_published(
             )
             .optional()
             .map_err(map_error)?;
+        let outcome = scan::stable_read(&root.join(path), MAX_SOURCE_BYTES)?;
+        let ReadOutcome::Content {
+            bytes,
+            size,
+            mtime_ns,
+        } = outcome
+        else {
+            return Ok(false);
+        };
+        if sync::hex_sha256(&bytes) != publication_hash {
+            return Ok(false);
+        }
         if stored.as_deref() != Some(publication_hash) {
-            let outcome =
-                scan::stable_read(&root.join(path), MAX_SOURCE_BYTES).map_err(Error::Io)?;
-            match outcome {
-                ReadOutcome::Content {
-                    bytes,
-                    size,
-                    mtime_ns,
-                } if sync::hex_sha256(&bytes) == publication_hash => {
-                    let text = std::str::from_utf8(&bytes).map_err(|_| Error::IndexCorrupt)?;
-                    let analyzed = doc::analyze(text, path);
-                    sync::replace_document(&tx, path, &analyzed, publication_hash, size, mtime_ns)
-                        .map_err(map_error)?;
-                }
-                // Edited, removed, or unreadable before indexing: report
-                // indexed:false rather than substituting later content.
-                _ => {
-                    tx.commit().map_err(map_error)?;
-                    return Ok(false);
-                }
-            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| Error::IndexCorrupt)?;
+            let analyzed = doc::analyze(text, path);
+            sync::replace_document(&tx, path, &analyzed, publication_hash, size, mtime_ns)
+                .map_err(map_error)?;
         }
         tx.commit().map_err(map_error)?;
     }
@@ -365,7 +381,20 @@ fn index_published(
 
 /// Create, publish, and index a note (plan.md section 9).
 pub fn create_note(root: &Path, index: &mut Index, input: NoteInput) -> Result<NoteOutput, Error> {
-    let parsed = validate(input)?;
+    create_prepared(
+        root,
+        validate(input)?,
+        || false,
+        |path, hash| index_published(index, root, path, hash),
+    )
+}
+
+pub(crate) fn create_prepared(
+    root: &Path,
+    parsed: Parsed,
+    cancelled: impl Fn() -> bool,
+    index: impl FnOnce(&str, &str) -> Result<bool, Error>,
+) -> Result<NoteOutput, Error> {
     check_supersedes(root, &parsed)?;
     let now = chrono::Utc::now();
     let text = document(
@@ -375,11 +404,11 @@ pub fn create_note(root: &Path, index: &mut Index, input: NoteInput) -> Result<N
     let publication_hash = sync::hex_sha256(text.as_bytes());
     let slug = slug(&parsed.title);
     let date = now.format("%Y-%m-%d").to_string();
-    let (path, mut warnings) = publish(root, &slug, text.as_bytes(), &date)?;
+    let (path, mut warnings) = publish(root, &slug, text.as_bytes(), &date, cancelled, random_hex)?;
 
     // Publication succeeded: every later failure is a warning, saved stays
     // true (9.4). Durability and indexing warnings precede advisory ones.
-    let indexed = match index_published(index, root, &path, &publication_hash) {
+    let indexed = match index(&path, &publication_hash) {
         Ok(v) => v,
         Err(e) => {
             warnings.push(Warning::new(
@@ -390,14 +419,20 @@ pub fn create_note(root: &Path, index: &mut Index, input: NoteInput) -> Result<N
             false
         }
     };
-    if !indexed && warnings.is_empty() {
+    if !indexed
+        && !warnings
+            .iter()
+            .any(|warning| warning.code == "INDEXING_FAILED")
+    {
         warnings.push(Warning::new(
             "INDEXING_FAILED",
             Some(path.clone()),
             "note was saved but its content changed before indexing",
         ));
     }
-    for c in &parsed.impacts {
+    let mut impacts = parsed.impacts;
+    impacts.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    for c in &impacts {
         let w = match inspect_impact(root, c) {
             ImpactTarget::Exists => None,
             ImpactTarget::Missing => Some("impact target does not currently exist"),
@@ -441,4 +476,82 @@ fn cap_warnings(mut ws: Vec<Warning>) -> (Vec<Warning>, bool) {
         truncated = true;
     }
     (ws, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn cancellation_at_the_publication_boundary_removes_only_its_tempfile() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = notes_dir(root.path());
+        fs::create_dir_all(&dir).unwrap();
+        let peer = dir.join(".epocnote-tmp-peer");
+        fs::write(&peer, "peer data").unwrap();
+        let checks = Cell::new(0);
+        let result = publish(
+            root.path(),
+            "abort",
+            b"staged data",
+            "2026-01-01",
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+                    true
+                } else {
+                    false
+                }
+            },
+            random_hex,
+        );
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(fs::read_to_string(peer).unwrap(), "peer data");
+    }
+
+    #[test]
+    fn publication_retries_collisions_without_replacing_existing_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = notes_dir(root.path());
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("2026-01-01-collision-0000000000000000.md");
+        fs::write(&first, "existing").unwrap();
+        let mut suffixes = (0..).map(|n| format!("{n:016x}"));
+        let (note, _) = publish(
+            root.path(),
+            "collision",
+            b"new content",
+            "2026-01-01",
+            || false,
+            || Ok(suffixes.next().unwrap()),
+        )
+        .unwrap();
+        assert!(note.ends_with("-0000000000000002.md"));
+        assert_eq!(fs::read_to_string(first).unwrap(), "existing");
+        assert_eq!(
+            fs::read_to_string(root.path().join(note)).unwrap(),
+            "new content"
+        );
+        assert_eq!(fs::read_dir(dir).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn peer_hash_certifies_publication_until_the_file_is_edited() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(notes_dir(root.path())).unwrap();
+        let mut index = Index::open(root.path()).unwrap();
+        let path = ".context/notes/sample.md";
+        let absolute = root.path().join(path);
+        let original = b"Original content\n";
+        fs::write(&absolute, original).unwrap();
+        let hash = sync::hex_sha256(original);
+        assert!(index_published(&mut index, root.path(), path, &hash).unwrap());
+        assert!(index_published(&mut index, root.path(), path, &hash).unwrap());
+        fs::write(&absolute, "Later content\n").unwrap();
+        assert!(!index_published(&mut index, root.path(), path, &hash).unwrap());
+        assert_eq!(fs::read_to_string(absolute).unwrap(), "Later content\n");
+    }
 }

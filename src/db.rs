@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT_MS: i64 = 5_000;
+pub(crate) type FileIdentity = (u64, u64);
 
 /// One open index connection. Each process serializes use of its own
 /// connections; there is no process-wide lock (section 6.1).
@@ -16,7 +17,7 @@ pub struct Index {
     path: PathBuf,
     /// Device + file identity captured when the connection was opened, used
     /// to notice the file being replaced underneath us (section 3.2).
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
 }
 
 impl Index {
@@ -51,6 +52,14 @@ impl Index {
 
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    pub(crate) fn identity(&self) -> Option<FileIdentity> {
+        self.identity
+    }
+
+    pub(crate) fn still_current(&self) -> bool {
+        self.identity.is_some() && file_identity(&self.path) == self.identity
     }
 
     /// Confirm the database path still names the file this connection opened
@@ -113,8 +122,11 @@ fn setup_connection(conn: &Connection) -> Result<(), Error> {
         "CREATE VIRTUAL TABLE temp._epocnote_fts5_probe USING fts5(x);
          DROP TABLE temp._epocnote_fts5_probe;",
     ) {
-        let _ = e;
-        return Err(Error::Fts5Unavailable);
+        return Err(if e.to_string().contains("no such module: fts5") {
+            Error::Fts5Unavailable
+        } else {
+            map_error(e)
+        });
     }
     Ok(())
 }
@@ -166,13 +178,16 @@ fn schema_complete(conn: &Connection) -> Result<bool, Error> {
     let n: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master
-             WHERE type = 'table'
-               AND name IN ('files','chunks','impacts','supersedes','chunks_fts')",
+             WHERE (type = 'table'
+                    AND name IN ('files','chunks','impacts','supersedes','chunks_fts'))
+                OR (type = 'trigger' AND name IN ('chunks_ai','chunks_ad','chunks_bu'))
+                OR (type = 'index'
+                    AND name IN ('idx_chunks_file','idx_impacts_target','idx_supersedes_target'))",
             [],
             |r| r.get(0),
         )
         .map_err(map_error)?;
-    Ok(n == 5)
+    Ok(n == 11)
 }
 
 /// Device + file identity of `path` (`None` if it cannot be stated).

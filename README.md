@@ -4,9 +4,8 @@ EpocNote gives coding agents and their teams a place to keep project
 decisions, architectural boundaries, and hard-won debugging findings.
 It stores that knowledge as Markdown alongside the code.
 
-**Project status.** The CLI supports project initialization, index rebuilds,
-and metadata checks. Search and note creation are implemented in the Rust
-library. The MCP server is still open work.
+**Project status.** The CLI includes a local MCP server for search and note
+creation, plus project initialization, index rebuilds, and metadata checks.
 [Track development on GitHub](https://github.com/andikapradanaarif/epocNote/issues).
 
 ## Background
@@ -29,7 +28,33 @@ a local search index that can be rebuilt from the notes.
 
 ## Build and run
 
-### 1. Get the source and build the CLI
+### 1. Install the CLI
+
+Download the archive and its `.sha256` file for your platform from
+[GitHub Releases](https://github.com/andikapradanaarif/epocNote/releases) or
+the [CI run for the commit](https://github.com/andikapradanaarif/epocNote/actions/workflows/ci.yml).
+Each package includes the executable, build details, and SQLite compile
+options. SQLite is bundled in the executable.
+
+| Package | Oldest OS tested by the release workflow |
+| --- | --- |
+| `epocnote-linux-x86_64.tar.gz` | Ubuntu 24.04 |
+| `epocnote-macos-arm64.tar.gz` | macOS 15 |
+| `epocnote-macos-x86_64.tar.gz` | macOS 15 |
+| `epocnote-windows-x86_64.zip` | Windows Server 2022 |
+
+On Linux, verify the archive with `sha256sum -c <archive>.sha256`. On macOS,
+use `shasum -a 256 -c <archive>.sha256`. On Windows, run
+`Get-FileHash -Algorithm SHA256 <archive>` and compare the hash with the
+first field in the checksum file.
+
+Extract the archive into a directory you control. Run the executable by
+its absolute path or add its directory to `PATH`. Verify the install with
+`epocnote --version`. To upgrade, stop any running EpocNote servers, replace
+the executable, and restart your client. Your Markdown stays in the
+project's `.context/` directory.
+
+#### Build from source
 
 You need Git, [Rustup](https://rustup.rs/), and a C compiler and linker for
 your Rust target. Rustup selects the version pinned in
@@ -97,8 +122,7 @@ epocnote init --root "/absolute/path/to/your project" --target codex
 
 Each run accepts one target. Rerunning `init` preserves existing architecture,
 notes, and skills. The generated skill gives the agent instructions for when
-to read, search, and record context. The launch command printed by `init` is
-for the planned MCP server.
+to read, search, and record context.
 
 ### 4. Verify the setup
 
@@ -172,12 +196,11 @@ supersession references, cycles, and invalid frontmatter. The default exits
 successfully when it finishes, even with findings. Use `--strict` to fail on
 findings in CI. An incomplete inspection fails in either mode.
 
-## Planned MCP setup
+## Connect an MCP client
 
-The [MCP server issue](https://github.com/andikapradanaarif/epocNote/issues/11)
-tracks `serve`. Once it ships, add a local stdio server entry to your MCP
-client with the absolute paths to the executable and the project root. Use
-your client's configuration format around this command and argument list.
+Add a local stdio server entry to your MCP client with absolute paths to the
+executable and the project root. Use your client's configuration format
+around this command and argument list.
 On Windows, use the `.exe` and escape backslashes in JSON paths.
 
 ```json
@@ -187,8 +210,9 @@ On Windows, use the `.exe` and escape backslashes in JSON paths.
 }
 ```
 
-The client will launch the process and discover the tools through MCP. To
-verify the setup once available, try this workflow in the initialized project.
+The client launches the process and discovers the tools through MCP. The
+server supports `2026-07-28` discovery and `2025-11-25` initialization. To
+verify the connection, try this workflow in the initialized project.
 
 1. Confirm the client lists `epocnote_search` and `epocnote_note`. If you
    installed a project skill, check whether the client can invoke it.
@@ -211,8 +235,8 @@ verify the setup once available, try this workflow in the initialized project.
    already exists. Search again after the index has caught up.
 
 See the [project specification](plan.md) for the Markdown and tool contracts
-and the [release issue](https://github.com/andikapradanaarif/epocNote/issues/12)
-for prebuilt binaries and platform verification.
+and [release verification](docs/acceptance.md) for tested protocols,
+benchmarks, and pilot status.
 
 ## Development
 

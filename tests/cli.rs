@@ -63,18 +63,19 @@ fn valid_argument_shapes_are_accepted() {
     assert!(run(&["rebuild", "--root", root]).status.success());
     assert!(run(&["check", "--root", root, "--strict"]).status.success());
 
-    // The server stub still accepts valid options.
+    // EOF on stdio exits cleanly without creating a new context.
     for args in [
         ["serve", "--root", root, "--scan-reuse", "auto"].as_slice(),
-        ["serve", "--scan-reuse", "off"].as_slice(),
+        ["serve", "--root", root, "--scan-reuse", "off"].as_slice(),
     ] {
         let out = run(args);
         assert_eq!(
             out.status.code(),
-            Some(1),
+            Some(0),
             "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        assert!(out.stdout.is_empty());
     }
 }
 

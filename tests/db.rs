@@ -192,3 +192,26 @@ fn sidecar_validation_blocks_symlinked_db() {
         assert!(matches!(Index::open(tmp.path()), Err(Error::UnsafePath(_))));
     }
 }
+
+#[test]
+fn missing_trigger_recreates_the_disposable_schema() {
+    let root = tempfile::tempdir().unwrap();
+    mk_context(root.path());
+    let index = Index::open(root.path()).unwrap();
+    index
+        .conn()
+        .execute_batch("DROP TRIGGER chunks_ai")
+        .unwrap();
+    drop(index);
+
+    let reopened = Index::open(root.path()).unwrap();
+    let count: i64 = reopened
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_ai'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}

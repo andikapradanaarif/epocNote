@@ -2,16 +2,11 @@ use clap::{Parser, Subcommand};
 use epocnote::check;
 use epocnote::init::{self, Target};
 use epocnote::root::discover_root;
+use epocnote::server;
 use epocnote::sync::{self, ScanReuse};
 use epocnote::{Error, Warning};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-// Pinned per plan.md section 1.3; used by the server in later work.
-use epocnote as _;
-use rmcp as _;
-use rusqlite as _;
-use tokio as _;
 
 #[derive(Parser)]
 #[command(
@@ -73,15 +68,29 @@ fn main() -> ExitCode {
         Command::Init { root, target } => cmd_init(root, target),
         Command::Rebuild { root } => cmd_rebuild(root.as_deref()),
         Command::Check { root, strict } => cmd_check(root.as_deref(), strict),
-        Command::Serve { .. } => {
-            eprintln!("epocnote: command not implemented yet");
-            ExitCode::from(1)
-        }
+        Command::Serve { root, scan_reuse } => cmd_serve(root.as_deref(), scan_reuse),
     }
 }
 
 fn maintenance_root(explicit: Option<&Path>) -> Result<PathBuf, Error> {
     discover_root(explicit, &std::env::current_dir()?, false)
+}
+
+fn cmd_serve(explicit: Option<&Path>, scan_reuse: ScanReuse) -> ExitCode {
+    let result = maintenance_root(explicit).and_then(|root| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(server::run(root, scan_reuse))
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("epocnote serve: {}: {error}", error.code());
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_rebuild(explicit: Option<&Path>) -> ExitCode {
@@ -153,7 +162,7 @@ fn cmd_init(root: Option<PathBuf>, target: Target) -> ExitCode {
         }
         Err(failure) => {
             print_report(&failure.report);
-            eprintln!("epocnote init: {}", failure.error);
+            eprintln!("epocnote init: {}: {}", failure.error.code(), failure.error);
             ExitCode::from(1)
         }
     }
@@ -172,7 +181,7 @@ fn print_warning(warning: &Warning) {
     let at = warning
         .path
         .as_deref()
-        .map(|p| format!(" ({p})"))
+        .map(|p| format!(" ({})", p.escape_debug()))
         .unwrap_or_default();
     eprintln!("warning[{}]{at}: {}", warning.code, warning.message);
 }

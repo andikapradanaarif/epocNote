@@ -11,6 +11,20 @@ pub const NOTES_DIR: &str = "notes";
 pub const DB_NAME: &str = ".epocnote.sqlite";
 const DB_SIDECARS: [&str; 2] = [".epocnote.sqlite-wal", ".epocnote.sqlite-shm"];
 
+/// Reject filesystem redirections before opening or traversing an entry.
+pub(crate) fn is_redirected(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 pub fn context_dir(root: &Path) -> PathBuf {
     root.join(CONTEXT_DIR)
 }
@@ -66,7 +80,7 @@ pub fn discover_root(explicit: Option<&Path>, cwd: &Path, init: bool) -> Result<
 }
 
 fn validate_context_entry(dir: &Path, context: &Path, md: &fs::Metadata) -> Result<PathBuf, Error> {
-    if md.file_type().is_symlink() {
+    if is_redirected(md) {
         return Err(Error::UnsafePath(format!(
             "{} is a symlink",
             context.display()
@@ -91,7 +105,7 @@ pub enum ContextStatus {
 pub fn validate_context_dir(root: &Path) -> Result<ContextStatus, Error> {
     let context = context_dir(root);
     match fs::symlink_metadata(&context) {
-        Ok(md) if md.file_type().is_symlink() => Err(Error::UnsafePath(format!(
+        Ok(md) if is_redirected(&md) => Err(Error::UnsafePath(format!(
             "{} is a symlink",
             context.display()
         ))),
@@ -111,7 +125,7 @@ pub fn validate_db_files(root: &Path) -> Result<(), Error> {
     for name in [DB_NAME, DB_SIDECARS[0], DB_SIDECARS[1]] {
         let path = context_dir(root).join(name);
         match fs::symlink_metadata(&path) {
-            Ok(md) if md.file_type().is_symlink() || !md.is_file() => {
+            Ok(md) if is_redirected(&md) || !md.is_file() => {
                 return Err(Error::UnsafePath(format!(
                     "{} is not a regular file",
                     path.display()

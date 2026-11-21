@@ -1,7 +1,7 @@
 //! Search-time synchronization: scan, compare, batched reconciliation, and
 //! scan reuse (plan.md section 6.3).
 
-use crate::db::{Index, map_error};
+use crate::db::{FileIdentity, Index, map_error};
 use crate::doc::{self, Analyzed};
 use crate::error::{Error, Warning, fit_warnings};
 use crate::scan::{self, EntryKind, ExclusionReason, MAX_SOURCE_BYTES, ReadOutcome, SkipReason};
@@ -36,6 +36,13 @@ pub struct SyncOutcome {
     pub scan_reused: bool,
 }
 
+#[doc(hidden)]
+pub struct SyncTimings {
+    pub scan_duration: Duration,
+    pub max_write_lock: Duration,
+    pub worker_running: bool,
+}
+
 /// Process-local scan cache and reconciliation worker state.
 pub struct IndexSync {
     inner: Arc<Inner>,
@@ -59,6 +66,7 @@ struct Shared {
     /// Stable exclusions discovered at read time (section 6.5).
     extra_excluded: usize,
     warnings: Vec<Warning>,
+    max_write_lock: Duration,
     /// Test hook overriding the reuse window calculation.
     reuse_window: Option<Duration>,
 }
@@ -125,7 +133,7 @@ pub fn rebuild(root: &Path) -> Result<RebuildReport, Error> {
     let mut offset = 0;
     while offset < diffs.len() {
         let end = (offset + BATCH_DOCS).min(diffs.len());
-        let (summary, applied) =
+        let (summary, applied, _) =
             apply_batch(&mut index, root, &diffs[offset..end], ReconcileMode::Verify)?;
         excluded_count += summary.excluded;
         failed_count += summary.failed;
@@ -160,6 +168,19 @@ impl IndexSync {
     }
 
     #[doc(hidden)]
+    pub fn timings(&self) -> SyncTimings {
+        let state = self.inner.state.lock().unwrap();
+        SyncTimings {
+            scan_duration: state
+                .cached
+                .as_ref()
+                .map_or(Duration::ZERO, |scan| scan.duration),
+            max_write_lock: state.max_write_lock,
+            worker_running: state.worker_running,
+        }
+    }
+
+    #[doc(hidden)]
     pub fn with_reuse_window(root: &Path, window: Duration) -> Self {
         let s = Self::new(root);
         s.inner.state.lock().unwrap().reuse_window = Some(window);
@@ -186,15 +207,15 @@ impl IndexSync {
     ) -> Result<SyncOutcome, Error> {
         let inner = &self.inner;
         let mut st = inner.state.lock().unwrap();
-        if st.worker_running {
-            st = self.wait(st, deadline);
-            return Ok(self.outcome(&st, false));
-        }
         if reuse == ScanReuse::Auto
             && let Some(c) = &st.cached
             && Instant::now() < c.finished + c.reuse_window(st.reuse_window)
         {
             return Ok(self.outcome(&st, true));
+        }
+        if st.worker_running {
+            st = self.wait(st, deadline);
+            return Ok(self.outcome(&st, false));
         }
         drop(st);
 
@@ -225,7 +246,8 @@ impl IndexSync {
         st.pending = diffs.into();
         st.worker_running = true;
         let inner = Arc::clone(inner);
-        std::thread::spawn(move || worker(inner));
+        let identity = index.identity();
+        std::thread::spawn(move || worker(inner, identity));
         st = self.wait(st, deadline);
         Ok(self.outcome(&st, false))
     }
@@ -361,7 +383,7 @@ fn path_of(d: &Diff) -> &str {
 
 // ---------- reconciliation worker (section 6.3 step 3) ----------
 
-fn worker(inner: Arc<Inner>) {
+fn worker(inner: Arc<Inner>, identity: Option<FileIdentity>) {
     let mut index = match Index::open(&inner.root) {
         Ok(i) => i,
         Err(e) => {
@@ -390,11 +412,19 @@ fn worker(inner: Arc<Inner>) {
             batch
         };
 
-        let committed = apply_batch(&mut index, &inner.root, &batch, ReconcileMode::Changed);
+        let committed =
+            if identity.is_some() && (index.identity() != identity || !index.still_current()) {
+                Err(Error::Io(std::io::Error::other(
+                    "index replaced during reconciliation",
+                )))
+            } else {
+                apply_batch(&mut index, &inner.root, &batch, ReconcileMode::Changed)
+            };
         let mut st = inner.state.lock().unwrap();
         st.inflight = st.inflight.saturating_sub(batch.len());
         match committed {
-            Ok((summary, applied)) => {
+            Ok((summary, applied, lock_duration)) => {
+                st.max_write_lock = st.max_write_lock.max(lock_duration);
                 st.warnings.extend(summary.warnings);
                 st.extra_excluded += summary.excluded;
                 st.had_failure |= summary.failed > 0;
@@ -441,7 +471,7 @@ fn apply_batch(
     root: &Path,
     batch: &[Diff],
     mode: ReconcileMode,
-) -> Result<(BatchSummary, usize), Error> {
+) -> Result<(BatchSummary, usize, Duration), Error> {
     let mut out = BatchSummary::default();
     let mut applied = 0usize;
     let tx = index
@@ -461,7 +491,7 @@ fn apply_batch(
         }
     }
     tx.commit().map_err(map_error)?;
-    Ok((out, applied))
+    Ok((out, applied, opened.elapsed()))
 }
 
 /// One document inside a batch transaction (section 6.3 steps 3.2–3.4).

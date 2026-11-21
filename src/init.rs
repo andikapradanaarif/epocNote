@@ -191,7 +191,7 @@ fn validate_scaffold_targets(root: &Path, target: Target) -> Result<SkillPlan, E
 /// An existing `.context`-style directory component must be a real directory.
 fn check_dir_target(path: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => Err(Error::UnsafePath(format!(
+        Ok(md) if crate::root::is_redirected(&md) => Err(Error::UnsafePath(format!(
             "{} is a symlink",
             path.display()
         ))),
@@ -209,7 +209,7 @@ fn check_dir_target(path: &Path) -> Result<(), Error> {
 /// it is then preserved rather than replaced (section 5.1).
 fn check_file_target(path: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => Err(Error::UnsafePath(format!(
+        Ok(md) if crate::root::is_redirected(&md) => Err(Error::UnsafePath(format!(
             "{} is a symlink",
             path.display()
         ))),
@@ -384,7 +384,7 @@ fn verify_gitignore(root: &Path, report: &mut InitReport) {
 /// file, `None` absent. A non-regular file counts as different.
 fn inspect_compatible_copy(path: &Path, template: &str) -> Result<Option<bool>, Error> {
     match fs::symlink_metadata(path) {
-        Ok(md) if md.is_file() && !md.file_type().is_symlink() => {
+        Ok(md) if md.is_file() && !crate::root::is_redirected(&md) => {
             Ok(Some(fs::read(path)? == template.as_bytes()))
         }
         Ok(_) => Ok(Some(false)),

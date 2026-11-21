@@ -15,17 +15,15 @@ pub const MAX_RESULTS: usize = 10;
 const DEFAULT_LIMIT: usize = 5;
 const MAX_QUERY_CHARS: usize = 512;
 const MAX_TOKENS: usize = 32;
-/// Compact tool-result cap (section 8.5): structured content plus its text
-/// copy plus a small envelope reserve.
-const RESULT_BUDGET: usize = 48 * 1024;
-const ENVELOPE_RESERVE: usize = 512;
 const MAX_SUPERSEDED_BY: usize = 8;
-const CATCH_UP: Duration = Duration::from_secs(2);
+pub(crate) const CATCH_UP: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchInput {
+    #[serde(default, deserialize_with = "crate::error::present")]
     pub query: Option<String>,
+    #[serde(default, deserialize_with = "crate::error::present")]
     pub path_filter: Option<String>,
     #[serde(default, deserialize_with = "de_limit")]
     pub limit: Limit,
@@ -49,7 +47,8 @@ fn de_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Limit, D::Error> {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct SearchResult {
     pub path: String,
     pub title: String,
@@ -67,7 +66,8 @@ pub struct SearchResult {
     pub superseded_by: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct SearchOutput {
     pub results: Vec<SearchResult>,
     pub mode: &'static str,
@@ -86,26 +86,36 @@ pub fn search(
     reuse: ScanReuse,
 ) -> Result<SearchOutput, Error> {
     let deadline = Instant::now() + CATCH_UP;
-    let parsed = validate(input)?;
+    search_prepared(index, sync, validate(input)?, reuse, deadline)
+}
+
+pub(crate) fn search_prepared(
+    index: &Index,
+    sync: &IndexSync,
+    parsed: Parsed,
+    reuse: ScanReuse,
+    deadline: Instant,
+) -> Result<SearchOutput, Error> {
     let coverage = sync.prepare_until(index, reuse, deadline)?;
-    let conn = index.conn();
-    let superseded = superseded_set(conn)?;
+    let conn = index.conn().unchecked_transaction().map_err(map_error)?;
+    let superseded = superseded_set(&conn)?;
     let ranked = match &parsed.tokens {
-        None => path_retrieval(conn, &parsed, &superseded)?,
-        Some(tokens) => text_retrieval(conn, &parsed, tokens, &superseded)?,
+        None => path_retrieval(&conn, &parsed, &superseded)?,
+        Some(tokens) => text_retrieval(&conn, &parsed, tokens, &superseded)?,
     };
-    let mut output = build_output(conn, ranked, parsed.limit, &coverage)?;
+    let mut output = build_output(&conn, ranked, parsed.limit, &coverage)?;
+    conn.commit().map_err(map_error)?;
     pack_results(&mut output);
     Ok(output)
 }
 
-struct Parsed {
+pub(crate) struct Parsed {
     filter: Option<CanonPath>,
     tokens: Option<Vec<String>>,
     limit: usize,
 }
 
-fn validate(input: SearchInput) -> Result<Parsed, Error> {
+pub(crate) fn validate(input: SearchInput) -> Result<Parsed, Error> {
     if input.query.is_none() && input.path_filter.is_none() {
         return Err(Error::InvalidArgument(
             "query or path_filter is required".into(),
@@ -331,14 +341,9 @@ fn doc_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<DocRow> {
 const DOC_COLS: &str = "f.path, f.title, f.kind, f.scope, f.created_at, f.hash,
      c.heading, c.start_line, c.end_line, c.body";
 
-/// Best-impact rank: class (exact 0, related 1, global 2), component
-/// distance, direction (ancestor 0, descendant 1).
-type RankKey = (u8, u32, u8);
-
 struct RankedDoc {
     doc: DocRow,
     tier: Option<&'static str>,
-    rank: RankKey,
 }
 
 /// Ranked candidate docs, best chunk per doc, before limit and budget.
@@ -361,58 +366,68 @@ fn path_retrieval(
     parsed: &Parsed,
     superseded: &HashSet<String>,
 ) -> Result<Ranked, Error> {
-    let impacts = match &parsed.filter {
-        Some(f) => Some(matching_impacts(conn, f)?),
-        None => None,
-    };
-    let mut stmt = conn
+    let filter = parsed
+        .filter
+        .as_ref()
+        .expect("path-only search requires a filter");
+    let impacts = matching_impacts(conn, filter)?;
+    let paths = serde_json::to_string(&impacts.keys().collect::<Vec<_>>())
+        .map_err(std::io::Error::other)?;
+    // Rank using small metadata rows. Load chunk text only for the documents
+    // selected by the limit, especially for narrow filters in large corpora.
+    let mut statement = conn
+        .prepare(
+            "WITH eligible(path) AS (
+                 SELECT value FROM json_each(?1)
+                 UNION SELECT path FROM files WHERE scope = 'global'
+             )
+             SELECT f.path, f.scope, f.created_at FROM eligible
+             JOIN files f USING(path)
+             WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.file_path = f.path)",
+        )
+        .map_err(map_error)?;
+    let rows = statement
+        .query_map([paths], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(map_error)?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (path, scope, created_at) = row.map_err(map_error)?;
+        let rank = if scope == "global" {
+            (2, 0, 0)
+        } else {
+            best_rank(&impacts[&path], filter)
+        };
+        candidates.push((
+            superseded.contains(&path),
+            rank,
+            std::cmp::Reverse(created_at),
+            path,
+        ));
+    }
+    let eligible = candidates.len();
+    candidates.sort_unstable();
+    let mut selected = conn
         .prepare(&format!(
             "SELECT {DOC_COLS}, NULL FROM files f
              JOIN chunks c ON c.id = (
                  SELECT c2.id FROM chunks c2 WHERE c2.file_path = f.path
-                 ORDER BY c2.start_line, c2.id LIMIT 1)"
+                 ORDER BY c2.start_line, c2.id LIMIT 1)
+             WHERE f.path = ?1"
         ))
         .map_err(map_error)?;
-    let rows = stmt
-        .query_map([], doc_from)
-        .map_err(map_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(map_error)?;
-
-    let mut docs: Vec<RankedDoc> = Vec::new();
-    for d in rows {
-        let rank = match &parsed.filter {
-            // No filter: all docs eligible, no impact ranking.
-            None => (0, 0, 0),
-            Some(f) => {
-                if d.scope == "global" {
-                    (2, 0, 0)
-                } else if let Some(list) = impacts.as_ref().and_then(|m| m.get(&d.path)) {
-                    best_rank(list, f)
-                } else {
-                    continue;
-                }
-            }
-        };
+    let mut docs = Vec::new();
+    for (_, _, _, path) in candidates.into_iter().take(parsed.limit) {
         docs.push(RankedDoc {
-            doc: d,
+            doc: selected.query_row([path], doc_from).map_err(map_error)?,
             tier: None,
-            rank,
         });
     }
-    let eligible = docs.len();
-    docs.sort_by(|a, b| {
-        let (da, ra) = (&a.doc, a.rank);
-        let (db, rb) = (&b.doc, b.rank);
-        let sa = superseded.contains(&da.path);
-        let sb = superseded.contains(&db.path);
-        (sa, ra, std::cmp::Reverse(da.created_at), &da.path).cmp(&(
-            sb,
-            rb,
-            std::cmp::Reverse(db.created_at),
-            &db.path,
-        ))
-    });
     Ok(Ranked {
         docs,
         eligible,
@@ -457,7 +472,6 @@ fn text_retrieval(
             tiers.push(RankedDoc {
                 doc: d,
                 tier: Some(tier),
-                rank: (0, 0, 0),
             });
         }
     }
@@ -544,18 +558,16 @@ fn build_output(
     })
 }
 
-/// Serialized size of the tool-result object: structured content plus its
-/// JSON-escaped text copy plus a small envelope reserve (section 8.5).
 fn serialized_size(out: &SearchOutput) -> usize {
-    let json = serde_json::to_string(out).unwrap_or_default();
-    let text_copy = serde_json::to_string(&json).unwrap_or_default();
-    json.len() + text_copy.len() + ENVELOPE_RESERVE
+    crate::wire::success(out)
+        .and_then(|result| serde_json::to_vec(&result))
+        .map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// Drop the lowest-ranked whole entries until both representations fit
 /// inside the 48 KiB budget; never split a chunk body.
 fn pack_results(out: &mut SearchOutput) {
-    while !out.results.is_empty() && serialized_size(out) > RESULT_BUDGET {
+    while !out.results.is_empty() && serialized_size(out) > crate::wire::RESULT_BUDGET {
         out.results.pop();
         out.truncated = true;
     }

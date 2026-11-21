@@ -21,11 +21,17 @@ pub enum ImpactTarget {
 /// Inspect the canonical impact under `root` component by component without
 /// dereferencing symlinks.
 pub fn inspect_impact(root: &Path, canonical: &CanonPath) -> ImpactTarget {
-    let mut current = root.to_path_buf();
-    for comp in canonical.components() {
-        current.push(comp);
-        match fs::symlink_metadata(&current) {
-            Ok(md) if md.file_type().is_symlink() => return ImpactTarget::SymlinkComponent,
+    if canonical.is_root() {
+        return ImpactTarget::Exists;
+    }
+    let path = canonical.as_str();
+    for end in path
+        .match_indices('/')
+        .map(|(end, _)| end)
+        .chain([path.len()])
+    {
+        match fs::symlink_metadata(root.join(&path[..end])) {
+            Ok(md) if crate::root::is_redirected(&md) => return ImpactTarget::SymlinkComponent,
             Ok(_) => {}
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
                 return ImpactTarget::Missing;

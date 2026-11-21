@@ -16,6 +16,7 @@ pub enum Error {
     Io(std::io::Error),
     AtomicPublishUnavailable,
     NameCollision,
+    Cancelled,
 }
 
 impl Error {
@@ -32,11 +33,16 @@ impl Error {
             Self::Io(_) => "IO_ERROR",
             Self::AtomicPublishUnavailable => "ATOMIC_PUBLISH_UNAVAILABLE",
             Self::NameCollision => "NAME_COLLISION",
+            Self::Cancelled => "REQUEST_CANCELLED",
         }
     }
 
     pub fn retryable(&self) -> bool {
         matches!(self, Self::IndexBusy | Self::NameCollision)
+            || matches!(self, Self::Io(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ))
     }
 }
 
@@ -71,8 +77,18 @@ impl fmt::Display for Error {
                 write!(f, "filesystem cannot provide atomic publication")
             }
             Self::NameCollision => write!(f, "note filename collision retries exhausted"),
+            Self::Cancelled => write!(f, "request cancelled before note publication"),
         }
     }
+}
+
+/// Optional fields may be omitted, but must have their declared type when present.
+pub(crate) fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl std::error::Error for Error {}
@@ -83,7 +99,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct Warning {
     pub code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
