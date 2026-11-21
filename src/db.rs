@@ -176,22 +176,34 @@ fn schema_complete(conn: &Connection) -> Result<bool, Error> {
 }
 
 /// Device + file identity of `path` (`None` if it cannot be stated).
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    let md = std::fs::metadata(path).ok()?;
-    identity_of(&md)
-}
-
 #[cfg(unix)]
-fn identity_of(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
     Some((md.dev(), md.ino()))
 }
 
+/// Volume + file index via GetFileInformationByHandle (the std MetadataExt
+/// accessors are still unstable on Windows).
 #[cfg(windows)]
-fn identity_of(md: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    md.file_index()
-        .map(|i| (md.volume_serial_number().unwrap_or(0), i))
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let f = std::fs::File::open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandle(
+            f.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE,
+            &mut info,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some((info.dwVolumeSerialNumber as u64, index))
 }
 
 /// Map engine errors onto the application codes (section 11).
