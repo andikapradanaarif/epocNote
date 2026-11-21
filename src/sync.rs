@@ -3,7 +3,7 @@
 
 use crate::db::{Index, map_error};
 use crate::doc::{self, Analyzed};
-use crate::error::{Error, Warning};
+use crate::error::{Error, Warning, fit_warnings};
 use crate::scan::{self, EntryKind, ExclusionReason, MAX_SOURCE_BYTES, ReadOutcome, SkipReason};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -55,8 +55,6 @@ struct Shared {
     /// Items popped into an in-flight batch.
     inflight: usize,
     worker_running: bool,
-    /// The last cycle's reconcile finished without failures or leftovers.
-    complete: bool,
     had_failure: bool,
     /// Stable exclusions discovered at read time (section 6.5).
     extra_excluded: usize,
@@ -74,7 +72,7 @@ struct CachedScan {
     warnings: Vec<Warning>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Diff {
     Apply {
         path: String,
@@ -86,8 +84,13 @@ enum Diff {
     },
 }
 
-/// Per-document reconciliation result; mutations always roll back together
-/// through a savepoint.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconcileMode {
+    Changed,
+    Verify,
+}
+
+/// Per-document reconciliation result. A file read failure leaves its row intact.
 #[derive(Debug, PartialEq, Eq)]
 enum ApplyOutcome {
     /// Content applied, or the row already matched.
@@ -96,6 +99,53 @@ enum ApplyOutcome {
     Excluded,
     /// Read-level failure: old content retained, warned, partial_index.
     Failed,
+}
+
+pub struct RebuildReport {
+    pub indexed_count: i64,
+    pub excluded_count: usize,
+    pub failed_count: usize,
+    pub warnings: Vec<Warning>,
+    pub warnings_truncated: bool,
+}
+
+/// Verify the index in place, including files whose size and mtime agree.
+pub fn rebuild(root: &Path) -> Result<RebuildReport, Error> {
+    let mut index = Index::open(root)?;
+    // A complete scan is required before making any reconciliation changes.
+    let started = Instant::now();
+    let entries = scan::scan_context(root)?;
+    let cached = cache_scan(entries, started.elapsed());
+    let rows = load_file_stats(index.conn())?;
+    let diffs = compute_diffs(&cached, &rows, ReconcileMode::Verify);
+
+    let mut excluded_count = cached.excluded_count;
+    let mut failed_count = 0;
+    let (mut warnings, mut warnings_truncated) = fit_warnings(cached.warnings);
+    let mut offset = 0;
+    while offset < diffs.len() {
+        let end = (offset + BATCH_DOCS).min(diffs.len());
+        let (summary, applied) =
+            apply_batch(&mut index, root, &diffs[offset..end], ReconcileMode::Verify)?;
+        excluded_count += summary.excluded;
+        failed_count += summary.failed;
+        warnings.extend(summary.warnings);
+        let (bounded, truncated) = fit_warnings(warnings);
+        warnings = bounded;
+        warnings_truncated |= truncated;
+        offset += applied;
+    }
+    let indexed_count = index
+        .conn()
+        .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+        .map_err(map_error)?;
+    Ok(RebuildReport {
+        indexed_count,
+        excluded_count,
+        failed_count,
+        warnings,
+        warnings_truncated,
+    })
 }
 
 impl IndexSync {
@@ -125,10 +175,19 @@ impl IndexSync {
         reuse: ScanReuse,
         budget: Duration,
     ) -> Result<SyncOutcome, Error> {
+        self.prepare_until(index, reuse, Instant::now() + budget)
+    }
+
+    pub(crate) fn prepare_until(
+        &self,
+        index: &Index,
+        reuse: ScanReuse,
+        deadline: Instant,
+    ) -> Result<SyncOutcome, Error> {
         let inner = &self.inner;
         let mut st = inner.state.lock().unwrap();
         if st.worker_running {
-            st = self.wait(st, budget);
+            st = self.wait(st, deadline);
             return Ok(self.outcome(&st, false));
         }
         if reuse == ScanReuse::Auto
@@ -146,9 +205,13 @@ impl IndexSync {
 
         // Step 2: compare against the files table on this connection.
         let rows = load_file_stats(index.conn())?;
-        let diffs = compute_diffs(&cached, &rows);
+        let diffs = compute_diffs(&cached, &rows, ReconcileMode::Changed);
 
         let mut st = inner.state.lock().unwrap();
+        if st.worker_running {
+            st = self.wait(st, deadline);
+            return Ok(self.outcome(&st, false));
+        }
         st.warnings = std::mem::take(&mut cached.warnings);
         st.cached = Some(cached);
         st.extra_excluded = 0;
@@ -157,23 +220,22 @@ impl IndexSync {
         if diffs.is_empty() {
             // An unchanged corpus never takes the write lock.
             st.pending.clear();
-            st.complete = true;
             return Ok(self.outcome(&st, false));
         }
         st.pending = diffs.into();
-        st.complete = false;
-        if !st.worker_running {
-            st.worker_running = true;
-            let inner = Arc::clone(inner);
-            std::thread::spawn(move || worker(inner));
-        }
-        st = self.wait(st, budget);
+        st.worker_running = true;
+        let inner = Arc::clone(inner);
+        std::thread::spawn(move || worker(inner));
+        st = self.wait(st, deadline);
         Ok(self.outcome(&st, false))
     }
 
-    /// Wait until the worker drains or `budget` elapses.
-    fn wait<'a>(&self, mut st: MutexGuard<'a, Shared>, budget: Duration) -> MutexGuard<'a, Shared> {
-        let deadline = Instant::now() + budget;
+    /// Wait until the worker drains or the search's original deadline expires.
+    fn wait<'a>(
+        &self,
+        mut st: MutexGuard<'a, Shared>,
+        deadline: Instant,
+    ) -> MutexGuard<'a, Shared> {
         while st.worker_running {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -254,7 +316,11 @@ fn load_file_stats(conn: &Connection) -> Result<Vec<(String, i64, i64)>, Error> 
 
 /// Merge the sorted candidate list with the sorted file rows into ordered
 /// diffs (binary lexical path order, section 6.3 step 2).
-fn compute_diffs(cached: &CachedScan, rows: &[(String, i64, i64)]) -> Vec<Diff> {
+fn compute_diffs(
+    cached: &CachedScan,
+    rows: &[(String, i64, i64)],
+    mode: ReconcileMode,
+) -> Vec<Diff> {
     let candidates: HashMap<&str, (u64, i64)> = cached
         .candidates
         .iter()
@@ -264,7 +330,8 @@ fn compute_diffs(cached: &CachedScan, rows: &[(String, i64, i64)]) -> Vec<Diff> 
     let mut diffs = Vec::new();
     for (path, size, mtime) in rows {
         match candidates.get(path.as_str()) {
-            Some((s, m)) if *s == *size as u64 && *m == *mtime => {}
+            Some((s, m))
+                if mode == ReconcileMode::Changed && *s == *size as u64 && *m == *mtime => {}
             Some((s, m)) => diffs.push(Diff::Apply {
                 path: path.clone(),
                 size: *s,
@@ -314,7 +381,6 @@ fn worker(inner: Arc<Inner>) {
             let mut st = inner.state.lock().unwrap();
             if st.pending.is_empty() {
                 st.worker_running = false;
-                st.complete = !st.had_failure;
                 inner.condvar.notify_all();
                 return;
             }
@@ -324,28 +390,34 @@ fn worker(inner: Arc<Inner>) {
             batch
         };
 
-        let committed = apply_batch(&mut index, &inner.root, &batch);
+        let committed = apply_batch(&mut index, &inner.root, &batch, ReconcileMode::Changed);
         let mut st = inner.state.lock().unwrap();
         st.inflight = st.inflight.saturating_sub(batch.len());
         match committed {
             Ok((summary, applied)) => {
                 st.warnings.extend(summary.warnings);
                 st.extra_excluded += summary.excluded;
-                st.had_failure |= summary.failed;
+                st.had_failure |= summary.failed > 0;
                 // Requeue the batch tail that did not fit in this window.
-                for d in batch[applied..].iter().rev() {
-                    st.pending.push_front(d.clone());
+                for d in batch.into_iter().skip(applied).rev() {
+                    st.pending.push_front(d);
                 }
             }
-            Err((warnings, applied)) => {
-                // Write-lock contention: committed batches remain; return the
-                // unapplied items and stop, leaving them for the next scan.
-                st.warnings.extend(warnings);
-                for d in batch[applied..].iter().rev() {
-                    st.pending.push_front(d.clone());
+            Err(error) => {
+                // The whole batch rolled back. Leave its items for the next scan.
+                let code = match error {
+                    Error::IndexBusy => "INDEX_BUSY",
+                    _ => "RECONCILE_FAILED",
+                };
+                st.warnings.push(Warning::new(
+                    code,
+                    None,
+                    format!("reconciliation stopped: {error}"),
+                ));
+                for d in batch.into_iter().rev() {
+                    st.pending.push_front(d);
                 }
                 st.worker_running = false;
-                st.complete = false;
                 inner.condvar.notify_all();
                 return;
             }
@@ -359,61 +431,37 @@ fn worker(inner: Arc<Inner>) {
 struct BatchSummary {
     warnings: Vec<Warning>,
     excluded: usize,
-    failed: bool,
+    failed: usize,
 }
 
 /// One batch transaction: at most BATCH_DOCS documents, closed at the first
-/// document boundary after BATCH_MS. `Ok` = committed; `Err` = stopped early,
-/// leftovers go back to the queue for the next scan (section 6.3).
+/// document boundary after BATCH_MS. On a database error the batch rolls back.
 fn apply_batch(
     index: &mut Index,
     root: &Path,
     batch: &[Diff],
-) -> Result<(BatchSummary, usize), (Vec<Warning>, usize)> {
+    mode: ReconcileMode,
+) -> Result<(BatchSummary, usize), Error> {
     let mut out = BatchSummary::default();
     let mut applied = 0usize;
-    let opened = Instant::now();
-    let tx = match index
+    let tx = index
         .conn_mut()
         .transaction_with_behavior(TransactionBehavior::Immediate)
-    {
-        Ok(tx) => tx,
-        Err(e) => {
-            out.warnings.push(Warning::new(
-                "INDEX_BUSY",
-                None,
-                format!(
-                    "reconciliation could not take the write lock: {}",
-                    map_error(e)
-                ),
-            ));
-            return Err((out.warnings, applied));
-        }
-    };
+        .map_err(map_error)?;
+    let opened = Instant::now();
     for d in batch {
-        match apply_one(&tx, root, d, &mut out.warnings) {
+        match apply_one(&tx, root, d, mode, &mut out.warnings)? {
             ApplyOutcome::Applied => {}
             ApplyOutcome::Excluded => out.excluded += 1,
-            ApplyOutcome::Failed => out.failed = true,
+            ApplyOutcome::Failed => out.failed += 1,
         }
         applied += 1;
-        if opened.elapsed() > Duration::from_millis(BATCH_MS) {
+        if opened.elapsed() >= Duration::from_millis(BATCH_MS) {
             break;
         }
     }
-    match tx.commit() {
-        Ok(()) => Ok((out, applied)),
-        Err(e) => {
-            out.warnings.push(Warning::new(
-                "RECONCILE_FAILED",
-                None,
-                format!("reconciliation batch failed to commit: {}", map_error(e)),
-            ));
-            // The whole transaction rolled back: every popped item must go
-            // back so it is retried and partial_index stays honest.
-            Err((out.warnings, 0))
-        }
-    }
+    tx.commit().map_err(map_error)?;
+    Ok((out, applied))
 }
 
 /// One document inside a batch transaction (section 6.3 steps 3.2–3.4).
@@ -421,14 +469,18 @@ fn apply_one(
     tx: &Transaction<'_>,
     root: &Path,
     d: &Diff,
+    mode: ReconcileMode,
     warns: &mut Vec<Warning>,
-) -> ApplyOutcome {
+) -> Result<ApplyOutcome, Error> {
     match d {
         Diff::Apply {
             path,
             size,
             mtime_ns,
-        } => apply_candidate(tx, root, path, *size, *mtime_ns, warns),
+        } => {
+            let scanned_stats = (mode == ReconcileMode::Changed).then_some((*size, *mtime_ns));
+            apply_candidate(tx, root, path, scanned_stats, warns)
+        }
         Diff::Remove { path } => apply_removal(tx, root, path, warns),
     }
 }
@@ -437,34 +489,22 @@ fn apply_candidate(
     tx: &Transaction<'_>,
     root: &Path,
     path: &str,
-    size: u64,
-    mtime_ns: i64,
+    scanned_stats: Option<(u64, i64)>,
     warns: &mut Vec<Warning>,
-) -> ApplyOutcome {
+) -> Result<ApplyOutcome, Error> {
     // Recheck under the lock: another process may have reconciled it (3.2).
-    let row: Option<(i64, i64, String)> = match tx
+    let row: Option<(i64, i64, String)> = tx
         .query_row(
             "SELECT size, mtime_ns, hash FROM files WHERE path = ?1",
             params![path],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
-    {
-        Ok(row) => row,
-        Err(e) => {
-            warns.push(Warning::new(
-                "READ_FAILED",
-                Some(path.to_string()),
-                format!("files lookup failed: {e}"),
-            ));
-            return ApplyOutcome::Failed;
-        }
-    };
+        .map_err(map_error)?;
     if let Some((s, m, _)) = &row
-        && *s == size as i64
-        && *m == mtime_ns
+        && scanned_stats == Some((*s as u64, *m))
     {
-        return ApplyOutcome::Applied;
+        return Ok(ApplyOutcome::Applied);
     }
 
     let abs = root.join(path);
@@ -476,7 +516,7 @@ fn apply_candidate(
                 Some(path.to_string()),
                 format!("could not read document: {e}"),
             ));
-            return ApplyOutcome::Failed;
+            return Ok(ApplyOutcome::Failed);
         }
     };
     match outcome {
@@ -486,43 +526,26 @@ fn apply_candidate(
             mtime_ns,
         } => {
             let hash = hex_sha256(&bytes);
-            if let Some((_, _, old_hash)) = &row
+            if let Some((old_size, old_mtime, old_hash)) = &row
                 && *old_hash == hash
             {
                 // Same bytes: update only the observed stats (6.3).
-                return match tx.execute(
-                    "UPDATE files SET size = ?2, mtime_ns = ?3 WHERE path = ?1",
-                    params![path, size as i64, mtime_ns],
-                ) {
-                    Ok(_) => ApplyOutcome::Applied,
-                    Err(e) => {
-                        warns.push(Warning::new(
-                            "WRITE_FAILED",
-                            Some(path.to_string()),
-                            format!("stats update failed: {e}"),
-                        ));
-                        ApplyOutcome::Failed
-                    }
-                };
+                if (*old_size, *old_mtime) != (size as i64, mtime_ns) {
+                    tx.execute(
+                        "UPDATE files SET size = ?2, mtime_ns = ?3 WHERE path = ?1",
+                        params![path, size as i64, mtime_ns],
+                    )
+                    .map_err(map_error)?;
+                }
+                return Ok(ApplyOutcome::Applied);
             }
             let Ok(text) = std::str::from_utf8(&bytes) else {
                 return stable_exclusion(tx, path, warns, "file is not valid UTF-8");
             };
             let analyzed = doc::analyze(text, path);
-            match replace_document(tx, path, &analyzed, &hash, size, mtime_ns) {
-                Ok(()) => {
-                    warns.extend(analyzed.warnings.iter().cloned());
-                    ApplyOutcome::Applied
-                }
-                Err(e) => {
-                    warns.push(Warning::new(
-                        "WRITE_FAILED",
-                        Some(path.to_string()),
-                        format!("document replace failed: {e}"),
-                    ));
-                    ApplyOutcome::Failed
-                }
-            }
+            replace_document(tx, path, &analyzed, &hash, size, mtime_ns).map_err(map_error)?;
+            warns.extend(analyzed.warnings);
+            Ok(ApplyOutcome::Applied)
         }
         ReadOutcome::Oversize => {
             stable_exclusion(tx, path, warns, "file exceeds the 1 MiB source limit")
@@ -534,7 +557,7 @@ fn apply_candidate(
                 Some(path.to_string()),
                 "document could not be read stably",
             ));
-            ApplyOutcome::Failed
+            Ok(ApplyOutcome::Failed)
         }
     }
 }
@@ -546,21 +569,10 @@ fn stable_exclusion(
     path: &str,
     warns: &mut Vec<Warning>,
     message: &'static str,
-) -> ApplyOutcome {
-    match delete_document(tx, path) {
-        Ok(()) => {
-            warns.push(Warning::new("EXCLUDED", Some(path.to_string()), message));
-            ApplyOutcome::Excluded
-        }
-        Err(e) => {
-            warns.push(Warning::new(
-                "WRITE_FAILED",
-                Some(path.to_string()),
-                format!("document removal failed: {e}"),
-            ));
-            ApplyOutcome::Failed
-        }
-    }
+) -> Result<ApplyOutcome, Error> {
+    delete_document(tx, path).map_err(map_error)?;
+    warns.push(Warning::new("EXCLUDED", Some(path.to_string()), message));
+    Ok(ApplyOutcome::Excluded)
 }
 
 fn apply_removal(
@@ -568,29 +580,21 @@ fn apply_removal(
     root: &Path,
     path: &str,
     warns: &mut Vec<Warning>,
-) -> ApplyOutcome {
-    // Confirm the path is still not an eligible candidate with one
-    // no-follow stat before deleting (section 6.3 step 3.4).
-    let abs = root.join(path);
-    if let Ok(md) = std::fs::symlink_metadata(&abs)
-        && md.is_file()
-        && md.len() <= MAX_SOURCE_BYTES
-        && path.ends_with(".md")
-    {
-        // An eligible regular file reappeared; the next scan handles it.
-        return ApplyOutcome::Applied;
-    }
-    match delete_document(tx, path) {
-        Ok(()) => ApplyOutcome::Applied,
+) -> Result<ApplyOutcome, Error> {
+    // Confirm the path is still ineligible before deleting (section 6.3).
+    match scan::is_candidate(root, path) {
+        Ok(true) => {} // A file reappeared; the next scan handles it.
+        Ok(false) => delete_document(tx, path).map_err(map_error)?,
         Err(e) => {
             warns.push(Warning::new(
-                "WRITE_FAILED",
+                "READ_FAILED",
                 Some(path.to_string()),
-                format!("document removal failed: {e}"),
+                format!("could not confirm document removal: {e}"),
             ));
-            ApplyOutcome::Failed
+            return Ok(ApplyOutcome::Failed);
         }
     }
+    Ok(ApplyOutcome::Applied)
 }
 
 pub(crate) fn delete_document(tx: &Transaction<'_>, path: &str) -> Result<(), rusqlite::Error> {
@@ -670,4 +674,40 @@ pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn exhausted_search_deadline_does_not_wait_for_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let context = root.path().join(".context");
+        fs::create_dir(&context).unwrap();
+        fs::write(context.join("new.md"), "Ready to index\n").unwrap();
+
+        let index = Index::open(root.path()).unwrap();
+        let mut writer = Index::open(root.path()).unwrap();
+        let lock = writer
+            .conn_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let sync = IndexSync::new(root.path());
+
+        let deadline = Instant::now();
+        let outcome = sync
+            .prepare_until(&index, ScanReuse::Off, deadline)
+            .unwrap();
+        assert!(outcome.partial_index);
+        assert_eq!(outcome.remaining, 1);
+        assert!(deadline.elapsed() < Duration::from_secs(1));
+
+        lock.rollback().unwrap();
+        let finished = sync
+            .prepare_for_search(&index, ScanReuse::Off, Duration::from_secs(5))
+            .unwrap();
+        assert!(!finished.partial_index);
+    }
 }

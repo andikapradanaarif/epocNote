@@ -60,13 +60,13 @@ fn valid_argument_shapes_are_accepted() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    // The remaining commands are stubs: accepted arguments reach the stub
-    // and exit 1 with a diagnostic on stderr, never a usage error (exit 2).
+    assert!(run(&["rebuild", "--root", root]).status.success());
+    assert!(run(&["check", "--root", root, "--strict"]).status.success());
+
+    // The server stub still accepts valid options.
     for args in [
-        ["serve", "--root", "/tmp", "--scan-reuse", "auto"].as_slice(),
+        ["serve", "--root", root, "--scan-reuse", "auto"].as_slice(),
         ["serve", "--scan-reuse", "off"].as_slice(),
-        ["rebuild", "--root", "/tmp"].as_slice(),
-        ["check", "--strict"].as_slice(),
     ] {
         let out = run(args);
         assert_eq!(

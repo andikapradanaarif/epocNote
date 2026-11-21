@@ -100,3 +100,43 @@ impl Warning {
         }
     }
 }
+
+/// Warning caps: dedupe `(code, path)`, order by path then code, at most 8
+/// entries of 160 scalars inside a 4 KiB serialized array (section 8.5).
+pub(crate) fn fit_warnings(mut ws: Vec<Warning>) -> (Vec<Warning>, bool) {
+    const MAX_WARNINGS: usize = 8;
+    const MAX_WARNING_BYTES: usize = 4 * 1024;
+    const MAX_WARNING_MSG: usize = 160;
+    const MAX_PATH_BYTES: usize = crate::scan::MAX_SOURCE_PATH_BYTES;
+
+    for w in &mut ws {
+        if w.message.chars().count() > MAX_WARNING_MSG {
+            w.message = w.message.chars().take(MAX_WARNING_MSG).collect();
+        }
+        if let Some(p) = &w.path
+            && p.len() > MAX_PATH_BYTES
+        {
+            w.path = Some(p[..p.floor_char_boundary(MAX_PATH_BYTES)].to_owned());
+        }
+    }
+    ws.sort_by(|a, b| {
+        (a.path.as_deref().unwrap_or(""), a.code.as_str())
+            .cmp(&(b.path.as_deref().unwrap_or(""), b.code.as_str()))
+    });
+    ws.dedup_by(|a, b| a.code == b.code && a.path == b.path);
+    let mut truncated = false;
+    while ws.len() > MAX_WARNINGS {
+        ws.pop();
+        truncated = true;
+    }
+    while !ws.is_empty()
+        && serde_json::to_string(&ws)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX)
+            > MAX_WARNING_BYTES
+    {
+        ws.pop();
+        truncated = true;
+    }
+    (ws, truncated)
+}

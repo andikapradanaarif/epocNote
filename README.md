@@ -4,9 +4,9 @@ EpocNote gives coding agents and their teams a place to keep project
 decisions, architectural boundaries, and hard-won debugging findings.
 It stores that knowledge as Markdown alongside the code.
 
-**Project status.** You can build the CLI, initialize a project, and maintain
-its notes today. Search and note creation are implemented in the Rust library.
-The MCP server and the `rebuild` and `check` commands are still open work.
+**Project status.** The CLI supports project initialization, index rebuilds,
+and metadata checks. Search and note creation are implemented in the Rust
+library. The MCP server is still open work.
 [Track development on GitHub](https://github.com/andikapradanaarif/epocNote/issues).
 
 ## Background
@@ -150,7 +150,29 @@ project-relative path, such as `.context/notes/session-revocation.md`.
 Superseded notes remain searchable and rank after notes with no recorded
 replacement.
 
-## Planned MCP setup and maintenance
+## Maintain the index and notes
+
+Run these commands from the project root, or pass `--root` with the path to
+the project.
+
+```sh
+epocnote rebuild
+epocnote check
+epocnote check --strict
+```
+
+`rebuild` reads and hashes every eligible Markdown file, so it catches edits
+that preserve both file size and modification time. It updates the existing
+SQLite index in batches and reports indexed, excluded, and failed document
+counts. If a document cannot be read, its last indexed version stays available
+and `rebuild` exits unsuccessfully after processing the other files.
+
+`check` reads the Markdown directly. It reports stale impact paths, unresolved
+supersession references, cycles, and invalid frontmatter. The default exits
+successfully when it finishes, even with findings. Use `--strict` to fail on
+findings in CI. An incomplete inspection fails in either mode.
+
+## Planned MCP setup
 
 The [MCP server issue](https://github.com/andikapradanaarif/epocNote/issues/11)
 tracks `serve`. Once it ships, add a local stdio server entry to your MCP
@@ -187,15 +209,6 @@ verify the setup once available, try this workflow in the initialized project.
 4. Check the returned path under `.context/notes/` and search for the new
    note. If the result says `saved: true` and `indexed: false`, the Markdown
    already exists. Search again after the index has caught up.
-
-The [maintenance command issue](https://github.com/andikapradanaarif/epocNote/issues/9)
-tracks the following commands.
-
-| Command | Planned behavior |
-| --- | --- |
-| `epocnote rebuild --root <dir>` | Verify all eligible Markdown against the index and reconcile changes |
-| `epocnote check --root <dir>` | Report stale impact paths, supersession problems, and invalid frontmatter |
-| `epocnote check --root <dir> --strict` | Exit unsuccessfully when the check reports findings |
 
 See the [project specification](plan.md) for the Markdown and tool contracts
 and the [release issue](https://github.com/andikapradanaarif/epocNote/issues/12)

@@ -1,6 +1,7 @@
 //! The no-follow `.context/` walk and stable file reads used by reconciliation
 //! (plan.md sections 3.2, 6.3, and 10.4).
 
+use crate::canon::{PathSource, canonicalize};
 use crate::error::Error;
 use crate::root::{DB_NAME, context_dir};
 use std::fs::{self, File};
@@ -44,7 +45,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone)]
 pub struct ScanEntry {
-    /// Path relative to the project root (`-`-joined from `.context/`); for a
+    /// Path relative to the project root, starting with `.context/`. For a
     /// non-UTF-8 name this is a lossy label used only for warnings, never as a
     /// database key.
     pub rel_path: String,
@@ -57,11 +58,16 @@ pub struct ScanEntry {
 pub fn scan_context(root: &Path) -> Result<Vec<ScanEntry>, Error> {
     let base = context_dir(root);
     let mut out = Vec::new();
-    visit(&base, ".context", &mut out)?;
+    visit(&base, ".context", true, &mut out)?;
     Ok(out)
 }
 
-fn visit(dir: &Path, rel_dir: &str, out: &mut Vec<ScanEntry>) -> Result<(), Error> {
+fn visit(
+    dir: &Path,
+    rel_dir: &str,
+    parent_is_utf8: bool,
+    out: &mut Vec<ScanEntry>,
+) -> Result<(), Error> {
     let mut children: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     children.sort_by_key(|e| e.file_name());
     for child in children {
@@ -69,13 +75,14 @@ fn visit(dir: &Path, rel_dir: &str, out: &mut Vec<ScanEntry>) -> Result<(), Erro
         let name_str = name.to_string_lossy();
         let rel = format!("{rel_dir}/{name_str}");
         let md = fs::symlink_metadata(child.path())?;
+        let is_utf8 = parent_is_utf8 && name.to_str().is_some();
 
         if md.file_type().is_symlink() {
             out.push(entry(rel, EntryKind::Skip(SkipReason::Symlink)));
             continue;
         }
         if md.is_dir() {
-            visit(&child.path(), &rel, out)?;
+            visit(&child.path(), &rel, is_utf8, out)?;
             continue;
         }
         if !md.is_file() {
@@ -84,7 +91,7 @@ fn visit(dir: &Path, rel_dir: &str, out: &mut Vec<ScanEntry>) -> Result<(), Erro
         }
 
         let name_bytes = name_bytes(&name);
-        if name_str.starts_with(TMP_PREFIX) || name_str.starts_with(DB_NAME) {
+        if is_internal(&name_str) {
             out.push(entry(rel, EntryKind::Skip(SkipReason::Internal)));
             continue;
         }
@@ -93,7 +100,7 @@ fn visit(dir: &Path, rel_dir: &str, out: &mut Vec<ScanEntry>) -> Result<(), Erro
             continue;
         }
         // A document path must be lossless UTF-8 within the byte limit.
-        if name.to_str().is_none() || rel.len() > MAX_SOURCE_PATH_BYTES {
+        if !is_utf8 || !is_supported_path(&rel) {
             out.push(entry(
                 rel,
                 EntryKind::Exclusion(ExclusionReason::UnsupportedPath),
@@ -113,6 +120,44 @@ fn visit(dir: &Path, rel_dir: &str, out: &mut Vec<ScanEntry>) -> Result<(), Erro
         ));
     }
     Ok(())
+}
+
+fn is_internal(name: &str) -> bool {
+    name.starts_with(TMP_PREFIX) || name.starts_with(DB_NAME)
+}
+
+fn is_supported_path(path: &str) -> bool {
+    path.len() <= MAX_SOURCE_PATH_BYTES
+        && canonicalize(path, PathSource::Stored).is_ok_and(|canonical| canonical.as_str() == path)
+}
+
+/// Confirm a previously indexed path still denotes an eligible candidate.
+pub(crate) fn is_candidate(root: &Path, path: &str) -> io::Result<bool> {
+    let Some((_, name)) = path.rsplit_once('/') else {
+        return Ok(false);
+    };
+    if !path.starts_with(".context/")
+        || !name.ends_with(".md")
+        || is_internal(name)
+        || !is_supported_path(path)
+    {
+        return Ok(false);
+    }
+    // Stat ancestor components separately so a skipped symlink directory
+    // cannot make its old descendants appear to have come back.
+    for (end, _) in path.match_indices('/') {
+        match fs::symlink_metadata(root.join(&path[..end])) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    match fs::symlink_metadata(root.join(path)) {
+        Ok(md) => Ok(md.is_file() && md.len() <= MAX_SOURCE_BYTES),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn entry(rel_path: String, kind: EntryKind) -> ScanEntry {

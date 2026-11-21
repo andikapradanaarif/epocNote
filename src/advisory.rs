@@ -27,7 +27,9 @@ pub fn inspect_impact(root: &Path, canonical: &CanonPath) -> ImpactTarget {
         match fs::symlink_metadata(&current) {
             Ok(md) if md.file_type().is_symlink() => return ImpactTarget::SymlinkComponent,
             Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => return ImpactTarget::Missing,
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return ImpactTarget::Missing;
+            }
             Err(_) => return ImpactTarget::InspectFailed,
         }
     }

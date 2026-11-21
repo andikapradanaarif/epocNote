@@ -3,12 +3,12 @@
 
 use crate::canon::{self, CanonPath, ImpactRank, PathSource};
 use crate::db::{Index, map_error};
-use crate::error::{Error, Warning};
+use crate::error::{Error, Warning, fit_warnings};
 use crate::sync::{IndexSync, ScanReuse};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use unicode_normalization::char::is_combining_mark;
 
 pub const MAX_RESULTS: usize = 10;
@@ -19,9 +19,6 @@ const MAX_TOKENS: usize = 32;
 /// copy plus a small envelope reserve.
 const RESULT_BUDGET: usize = 48 * 1024;
 const ENVELOPE_RESERVE: usize = 512;
-const MAX_WARNINGS: usize = 8;
-const MAX_WARNING_BYTES: usize = 4 * 1024;
-const MAX_WARNING_MSG: usize = 160;
 const MAX_SUPERSEDED_BY: usize = 8;
 const CATCH_UP: Duration = Duration::from_secs(2);
 
@@ -88,8 +85,9 @@ pub fn search(
     input: SearchInput,
     reuse: ScanReuse,
 ) -> Result<SearchOutput, Error> {
+    let deadline = Instant::now() + CATCH_UP;
     let parsed = validate(input)?;
-    let coverage = sync.prepare_for_search(index, reuse, CATCH_UP)?;
+    let coverage = sync.prepare_until(index, reuse, deadline)?;
     let conn = index.conn();
     let superseded = superseded_set(conn)?;
     let ranked = match &parsed.tokens {
@@ -561,39 +559,4 @@ fn pack_results(out: &mut SearchOutput) {
         out.results.pop();
         out.truncated = true;
     }
-}
-
-/// Warning caps: dedupe `(code, path)`, order by path then code, at most 8
-/// entries of 160 scalars inside a 4 KiB serialized array (section 8.5).
-fn fit_warnings(mut ws: Vec<Warning>) -> (Vec<Warning>, bool) {
-    for w in &mut ws {
-        if w.message.chars().count() > MAX_WARNING_MSG {
-            w.message = w.message.chars().take(MAX_WARNING_MSG).collect();
-        }
-        if let Some(p) = &w.path
-            && p.chars().count() > crate::scan::MAX_SOURCE_PATH_BYTES
-        {
-            w.path = Some(p.chars().take(crate::scan::MAX_SOURCE_PATH_BYTES).collect());
-        }
-    }
-    ws.sort_by(|a, b| {
-        (a.path.as_deref().unwrap_or(""), a.code.as_str())
-            .cmp(&(b.path.as_deref().unwrap_or(""), b.code.as_str()))
-    });
-    ws.dedup_by(|a, b| a.code == b.code && a.path == b.path);
-    let mut truncated = false;
-    while ws.len() > MAX_WARNINGS {
-        ws.pop();
-        truncated = true;
-    }
-    while !ws.is_empty()
-        && serde_json::to_string(&ws)
-            .map(|s| s.len())
-            .unwrap_or(usize::MAX)
-            > MAX_WARNING_BYTES
-    {
-        ws.pop();
-        truncated = true;
-    }
-    (ws, truncated)
 }

@@ -28,13 +28,13 @@ dependencies to exact versions that are at least 7 days old.
 
 ## Layout
 
-- `src/` — library modules; `main.rs` is the CLI entry point
-  (`init` implemented; `serve`, `rebuild`, `check` are stubs until their
-  issues land).
+- `src/` — library modules; `main.rs` implements `init`, `rebuild`, and
+  `check`. `serve` is a stub.
 - `src/root.rs`, `src/canon.rs`, `src/scan.rs` — root discovery, canonical
   paths, no-follow filesystem scan/read rules.
-- `src/db.rs`, `src/sync.rs` — SQLite lifecycle and search-time
-  synchronization (scan → diff → batched reconcile → reuse).
+- `src/db.rs`, `src/sync.rs` — SQLite lifecycle, search-time
+  synchronization, and forced rebuilds.
+- `src/check.rs` — read-only checks of impacts and supersession.
 - `src/doc.rs` — frontmatter parsing and chunking.
 - `src/search.rs`, `src/note.rs` — the `epocnote_search` and
   `epocnote_note` tool logic.

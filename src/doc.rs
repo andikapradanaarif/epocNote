@@ -80,12 +80,22 @@ pub struct Analyzed {
     pub malformed_frontmatter: bool,
 }
 
-/// Analyze one document: frontmatter contract plus body chunking.
-/// `doc_path` is the canonical context-relative path (`".context/..."`),
-/// used for self-supersession checks and the filename-stem title fallback.
-pub fn analyze(text: &str, doc_path: &str) -> Analyzed {
-    let mut warnings = Vec::new();
+pub(crate) struct Frontmatter {
+    title: Option<String>,
+    kind: DocKind,
+    scope: Scope,
+    created_at: i64,
+    pub impacts: Vec<CanonPath>,
+    pub supersedes: Vec<CanonPath>,
+    pub warnings: Vec<Warning>,
+    body_start: usize,
+    malformed: bool,
+}
+
+/// Parse metadata without chunking the Markdown body.
+pub(crate) fn frontmatter(text: &str, doc_path: &str) -> Frontmatter {
     let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut warnings = Vec::new();
 
     let mut malformed = false;
     let mut title_field: Option<String> = None;
@@ -148,6 +158,36 @@ pub fn analyze(text: &str, doc_path: &str) -> Analyzed {
             }
         },
     }
+
+    Frontmatter {
+        title: title_field,
+        kind,
+        scope,
+        created_at,
+        impacts,
+        supersedes,
+        warnings,
+        body_start,
+        malformed,
+    }
+}
+
+/// Analyze one document: frontmatter contract plus body chunking.
+/// `doc_path` is the canonical context-relative path, used for
+/// self-supersession checks and the filename-stem title fallback.
+pub fn analyze(text: &str, doc_path: &str) -> Analyzed {
+    let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let Frontmatter {
+        title: title_field,
+        kind,
+        scope,
+        created_at,
+        impacts,
+        supersedes,
+        mut warnings,
+        body_start,
+        malformed,
+    } = frontmatter(text, doc_path);
 
     // When malformed, the body is the entire raw text (section 4.2). All
     // offsets are measured in `stripped` so positions stay consistent

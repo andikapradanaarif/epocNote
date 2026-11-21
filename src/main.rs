@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
+use epocnote::check;
 use epocnote::init::{self, Target};
-use epocnote::sync::ScanReuse;
-use std::path::PathBuf;
+use epocnote::root::discover_root;
+use epocnote::sync::{self, ScanReuse};
+use epocnote::{Error, Warning};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 // Pinned per plan.md section 1.3; used by the server in later work.
@@ -68,9 +71,64 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { root, target } => cmd_init(root, target),
-        Command::Serve { .. } | Command::Rebuild { .. } | Command::Check { .. } => {
+        Command::Rebuild { root } => cmd_rebuild(root.as_deref()),
+        Command::Check { root, strict } => cmd_check(root.as_deref(), strict),
+        Command::Serve { .. } => {
             eprintln!("epocnote: command not implemented yet");
             ExitCode::from(1)
+        }
+    }
+}
+
+fn maintenance_root(explicit: Option<&Path>) -> Result<PathBuf, Error> {
+    discover_root(explicit, &std::env::current_dir()?, false)
+}
+
+fn cmd_rebuild(explicit: Option<&Path>) -> ExitCode {
+    let result = maintenance_root(explicit).and_then(|root| sync::rebuild(&root));
+    match result {
+        Ok(report) => {
+            println!("indexed_count: {}", report.indexed_count);
+            println!("excluded_count: {}", report.excluded_count);
+            println!("failed_count: {}", report.failed_count);
+            for warning in &report.warnings {
+                print_warning(warning);
+            }
+            if report.warnings_truncated {
+                eprintln!("epocnote rebuild: additional warnings omitted");
+            }
+            if report.failed_count == 0 {
+                ExitCode::SUCCESS
+            } else {
+                eprintln!(
+                    "epocnote rebuild: IO_ERROR: could not verify {} document(s)",
+                    report.failed_count
+                );
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("epocnote rebuild: {}: {e}", e.code());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_check(explicit: Option<&Path>, strict: bool) -> ExitCode {
+    match maintenance_root(explicit).and_then(|root| check::check(&root)) {
+        Ok(findings) => {
+            for finding in &findings {
+                println!("{}: {}: {}", finding.path, finding.code, finding.detail);
+            }
+            if strict && !findings.is_empty() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(e) => {
+            eprintln!("epocnote check: {}: {e}", e.code());
+            ExitCode::FAILURE
         }
     }
 }
@@ -106,11 +164,15 @@ fn print_report(report: &init::InitReport) {
         println!("{action}");
     }
     for warning in &report.warnings {
-        let at = warning
-            .path
-            .as_deref()
-            .map(|p| format!(" ({p})"))
-            .unwrap_or_default();
-        eprintln!("warning[{}]{at}: {}", warning.code, warning.message);
+        print_warning(warning);
     }
+}
+
+fn print_warning(warning: &Warning) {
+    let at = warning
+        .path
+        .as_deref()
+        .map(|p| format!(" ({p})"))
+        .unwrap_or_default();
+    eprintln!("warning[{}]{at}: {}", warning.code, warning.message);
 }
