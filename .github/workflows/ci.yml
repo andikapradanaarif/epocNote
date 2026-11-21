@@ -17,8 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Installs the toolchain and components pinned in rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@master
+      # rustup reads rust-toolchain.toml from the repo and installs the pinned
+      # toolchain automatically; `rustup show` materializes it before cargo runs.
+      - name: Install toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
 
       - name: Format
         run: cargo fmt --all -- --check
