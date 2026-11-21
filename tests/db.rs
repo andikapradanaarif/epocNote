@@ -134,6 +134,10 @@ fn uninitialized_context_is_not_initialized() {
     ));
 }
 
+// Windows cannot remove or replace a database file while this process holds
+// it open, so these scenarios are only reachable on platforms that allow
+// unlinking open files.
+#[cfg(unix)]
 #[test]
 fn ensure_current_reopens_replaced_db() {
     let tmp = TempDir::new().unwrap();
@@ -164,6 +168,7 @@ fn ensure_current_reopens_replaced_db() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ensure_current_reports_missing_context() {
     let tmp = TempDir::new().unwrap();
