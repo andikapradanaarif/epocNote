@@ -4,9 +4,9 @@
 use epocnote::advisory::{ImpactTarget, inspect_impact};
 use epocnote::canon::{PathSource, canonicalize_with_host};
 use epocnote::error::Error;
-use epocnote::root::{
-    ContextStatus, context_dir, db_path, discover_root, validate_context_dir, validate_db_files,
-};
+#[cfg(unix)]
+use epocnote::root::validate_db_files;
+use epocnote::root::{ContextStatus, context_dir, db_path, discover_root, validate_context_dir};
 use epocnote::scan::{
     EntryKind, ExclusionReason, MAX_SOURCE_BYTES, ReadOutcome, SkipReason, scan_context,
     stable_read,
