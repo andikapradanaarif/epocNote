@@ -2,9 +2,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-mod db;
-
 // Pinned per plan.md section 1.3; used by the server in later work.
+use epocnote as _;
 use rmcp as _;
 use rusqlite as _;
 use tokio as _;
