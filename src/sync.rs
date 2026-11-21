@@ -591,14 +591,14 @@ fn apply_removal(
     }
 }
 
-fn delete_document(tx: &Transaction<'_>, path: &str) -> Result<(), rusqlite::Error> {
+pub(crate) fn delete_document(tx: &Transaction<'_>, path: &str) -> Result<(), rusqlite::Error> {
     // Explicit chunk delete first; impacts/supersedes cascade (6.4).
     tx.execute("DELETE FROM chunks WHERE file_path = ?1", params![path])?;
     tx.execute("DELETE FROM files WHERE path = ?1", params![path])?;
     Ok(())
 }
 
-fn replace_document(
+pub(crate) fn replace_document(
     tx: &Transaction<'_>,
     path: &str,
     a: &Analyzed,
@@ -662,7 +662,7 @@ fn replace_document(
     Ok(())
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(64);
     for b in Sha256::digest(bytes) {
         out.push_str(&format!("{b:02x}"));

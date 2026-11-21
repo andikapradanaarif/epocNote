@@ -4,6 +4,7 @@ pub mod db;
 pub mod doc;
 pub mod error;
 pub mod init;
+pub mod note;
 pub mod root;
 pub mod scan;
 pub mod search;

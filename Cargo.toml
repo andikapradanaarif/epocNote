@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 clap = { version = "4", features = ["derive"] }
+getrandom = "0.4.3"
 pulldown-cmark = "=0.13.6"
 rmcp = { version = "=3.10.0", features = ["server", "transport-io"] }
 rusqlite = { version = "=0.42.0", features = ["bundled"] }
