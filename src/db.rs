@@ -1,12 +1,211 @@
-//! Fresh-database DDL (plan.md section 10.3) and the bundled-engine checks the
-//! CI matrix must pass: FTS5 availability, the `porter unicode61` tokenizer, and
-//! the actual bm25 ranking query used by search.
+//! Index connection setup, schema version lifecycle, and the fresh-database
+//! DDL (plan.md sections 6.1, 6.2, 10.2, 10.3).
+
+use crate::error::Error;
+use crate::root::{ContextStatus, db_path, validate_context_dir, validate_db_files};
+use rusqlite::{Connection, TransactionBehavior};
+use std::path::{Path, PathBuf};
+
+pub const SCHEMA_VERSION: i64 = 1;
+const BUSY_TIMEOUT_MS: i64 = 5_000;
+
+/// One open index connection. Each process serializes use of its own
+/// connections; there is no process-wide lock (section 6.1).
+pub struct Index {
+    conn: Connection,
+    path: PathBuf,
+    /// Device + file identity captured when the connection was opened, used
+    /// to notice the file being replaced underneath us (section 3.2).
+    identity: Option<(u64, u64)>,
+}
+
+impl Index {
+    /// Open (creating if needed) the context database under `root/.context`,
+    /// apply per-connection pragmas, verify FTS5, and reconcile the schema
+    /// version per section 6.2.
+    pub fn open(root: &Path) -> Result<Self, Error> {
+        match validate_context_dir(root)? {
+            ContextStatus::NotInitialized => return Err(Error::NotInitialized),
+            ContextStatus::Ready => {}
+        }
+        let mut index = Self::open_file(&db_path(root))?;
+        index.identity = file_identity(&index.path);
+        Ok(index)
+    }
+
+    fn open_file(path: &Path) -> Result<Self, Error> {
+        validate_db_files_for(path)?;
+        let mut conn = Connection::open(path).map_err(map_error)?;
+        setup_connection(&conn)?;
+        ensure_schema(&mut conn)?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            identity: None,
+        })
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Confirm the database path still names the file this connection opened
+    /// (device + file identity). When the file was replaced — for example a
+    /// recreated `.context/` — close the stale connection and reopen against
+    /// the validated path. Returns whether the connection was reopened.
+    pub fn ensure_current(&mut self) -> Result<bool, Error> {
+        let current = file_identity(&self.path);
+        if current.is_some() && current == self.identity {
+            return Ok(false);
+        }
+        if let Some(parent) = self.path.parent()
+            && !parent.is_dir()
+        {
+            return Err(Error::NotInitialized);
+        }
+        // Assigning *self drops the stale connection and stores the new one.
+        let path = self.path.clone();
+        *self = Self::open_file(&path)?;
+        self.identity = file_identity(&self.path);
+        Ok(true)
+    }
+}
+
+/// Validate the database and sidecar files beneath a `.context` directory
+/// (reuses the rules in root.rs via the db file's ancestors).
+fn validate_db_files_for(path: &Path) -> Result<(), Error> {
+    let Some(root) = path.parent().and_then(|c| c.parent()) else {
+        return Err(Error::UnsafePath(
+            "database path is not under a project root".into(),
+        ));
+    };
+    validate_db_files(root)
+}
+
+/// Per-connection pragmas and the defensive FTS5 probe (sections 6.1, 10.2).
+fn setup_connection(conn: &Connection) -> Result<(), Error> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(map_error)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)
+        .map_err(map_error)?;
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .map_err(map_error)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        // Change it only when needed, outside a transaction, and verify the
+        // returned mode (section 6.1).
+        let new_mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .map_err(map_error)?;
+        if !new_mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "journal_mode is {new_mode}, expected wal"
+            ))));
+        }
+    }
+    // Defensive check for builds without FTS5 (section 6.1); bundled builds
+    // always pass. Uses a temp table so no catalog objects remain.
+    if let Err(e) = conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp._epocnote_fts5_probe USING fts5(x);
+         DROP TABLE temp._epocnote_fts5_probe;",
+    ) {
+        let _ = e;
+        return Err(Error::Fts5Unavailable);
+    }
+    Ok(())
+}
+
+/// Schema version lifecycle (section 6.2).
+fn ensure_schema(conn: &mut Connection) -> Result<(), Error> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(map_error)?;
+    if version > SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew);
+    }
+    if version == SCHEMA_VERSION && schema_complete(conn)? {
+        return Ok(());
+    }
+    // Missing or older schema: recreate inside one immediate transaction,
+    // re-reading the version because another process may have recreated it
+    // while this one waited.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(map_error)?;
+    if version > SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew);
+    }
+    if version == SCHEMA_VERSION && schema_complete(&tx)? {
+        tx.commit().map_err(map_error)?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS chunks_ai;
+         DROP TRIGGER IF EXISTS chunks_ad;
+         DROP TRIGGER IF EXISTS chunks_bu;
+         DROP TABLE IF EXISTS chunks_fts;
+         DROP TABLE IF EXISTS chunks;
+         DROP TABLE IF EXISTS impacts;
+         DROP TABLE IF EXISTS supersedes;
+         DROP TABLE IF EXISTS files;",
+    )
+    .map_err(map_error)?;
+    tx.execute_batch(SCHEMA_DDL).map_err(map_error)?;
+    tx.commit().map_err(map_error)?;
+    Ok(())
+}
+
+fn schema_complete(conn: &Connection) -> Result<bool, Error> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('files','chunks','impacts','supersedes','chunks_fts')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(map_error)?;
+    Ok(n == 5)
+}
+
+/// Device + file identity of `path` (`None` if it cannot be stated).
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    identity_of(&md)
+}
+
+#[cfg(unix)]
+fn identity_of(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(windows)]
+fn identity_of(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    md.file_index()
+        .map(|i| (md.volume_serial_number().unwrap_or(0), i))
+}
+
+/// Map engine errors onto the application codes (section 11).
+pub fn map_error(e: rusqlite::Error) -> Error {
+    use rusqlite::ErrorCode;
+    match e {
+        rusqlite::Error::SqliteFailure(code, _) => match code.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => Error::IndexBusy,
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => Error::IndexCorrupt,
+            _ => Error::Io(std::io::Error::other(e)),
+        },
+        other => Error::Io(std::io::Error::other(other)),
+    }
+}
 
 /// Schema for a new database. Applied once inside a transaction when a database
 /// is created or recreated (plan.md sections 6.2 and 10.3); never run
 /// unconditionally at startup.
-// Used only by tests until the index lifecycle lands.
-#[allow(dead_code)]
 pub const SCHEMA_DDL: &str = r#"
 CREATE TABLE files (
     path          TEXT PRIMARY KEY NOT NULL,
