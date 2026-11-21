@@ -409,7 +409,9 @@ fn apply_batch(
                 None,
                 format!("reconciliation batch failed to commit: {}", map_error(e)),
             ));
-            Err((out.warnings, applied))
+            // The whole transaction rolled back: every popped item must go
+            // back so it is retried and partial_index stays honest.
+            Err((out.warnings, 0))
         }
     }
 }

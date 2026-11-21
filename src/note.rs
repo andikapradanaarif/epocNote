@@ -52,16 +52,20 @@ fn invalid(msg: impl Into<String>) -> Error {
 }
 
 fn validate(input: NoteInput) -> Result<Parsed, Error> {
-    let title = input.title.trim();
-    if title.is_empty()
-        || title.chars().count() > MAX_TITLE_CHARS
-        || title
-            .chars()
-            .any(|c| c == '\n' || c == '\r' || c.is_control())
+    // Newlines and control characters are rejected anywhere in the raw
+    // title, including a trailing newline that trimming would erase.
+    if input
+        .title
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c.is_control())
     {
         return Err(invalid(
-            "title must be nonempty, at most 200 characters, without newlines or control characters",
+            "title must not contain newlines or control characters",
         ));
+    }
+    let title = input.title.trim();
+    if title.is_empty() || title.chars().count() > MAX_TITLE_CHARS {
+        return Err(invalid("title must be nonempty and at most 200 characters"));
     }
     // Normalize CRLF and lone CR before the size check (9.1).
     let body = input.body.replace("\r\n", "\n").replace('\r', "\n");
@@ -110,8 +114,9 @@ fn validate(input: NoteInput) -> Result<Parsed, Error> {
     })
 }
 
-/// Supersedes targets must canonicalize beneath `.context/` and name an
-/// existing regular Markdown file (9.1) — a rejection, not a warning.
+/// Supersedes targets must canonicalize beneath `.context/`, name an
+/// existing regular Markdown file, and have no symlinked ancestor (9.1,
+/// 3.2) — a rejection, not a warning.
 fn check_supersedes(root: &Path, parsed: &Parsed) -> Result<(), Error> {
     for c in &parsed.supersedes {
         let s = c.as_str();
@@ -121,11 +126,11 @@ fn check_supersedes(root: &Path, parsed: &Parsed) -> Result<(), Error> {
             )));
         }
         let abs = root.join(s);
-        match fs::symlink_metadata(&abs) {
-            Ok(md) if md.is_file() => {}
+        match (inspect_impact(root, c), fs::symlink_metadata(&abs)) {
+            (ImpactTarget::Exists, Ok(md)) if md.is_file() => {}
             _ => {
                 return Err(invalid(format!(
-                    "supersedes target {s:?} does not name an existing regular file"
+                    "supersedes target {s:?} is not an existing regular context document"
                 )));
             }
         }
@@ -186,10 +191,9 @@ fn slug(title: &str) -> String {
         } else {
             pending_dash = !out.is_empty();
         }
-        if out.chars().count() >= 60 {
-            break;
-        }
     }
+    // Cap at 60 characters after building, so a separator never spills over.
+    let out: String = out.chars().take(60).collect();
     let out = out.trim_end_matches('-').to_string();
     if out.is_empty() { "note".into() } else { out }
 }
@@ -206,9 +210,30 @@ fn notes_dir(root: &Path) -> PathBuf {
 
 /// Write to a unique `.epocnote-tmp-*` file, then publish by hard link so the
 /// destination never receives a partially written name (9.3). The link step
-/// fails when the destination already exists.
-fn publish(root: &Path, slug: &str, bytes: &[u8], date: &str) -> Result<String, Error> {
+/// fails when the destination already exists. Once the link succeeds the note
+/// exists: durability and cleanup failures return as warnings, never errors
+/// that could misreport the note as unsaved or trigger a duplicate retry.
+fn publish(
+    root: &Path,
+    slug: &str,
+    bytes: &[u8],
+    date: &str,
+) -> Result<(String, Vec<Warning>), Error> {
     let dir = notes_dir(root);
+    // The publication directory must be a real directory beneath a real
+    // .context — a symlink here would publish outside the project (3.2).
+    for d in [&root.join(".context"), &dir] {
+        match fs::symlink_metadata(d) {
+            Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(Error::UnsafePath(format!(
+                    "{} is not a real directory",
+                    d.display()
+                )));
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
     for _ in 0..MAX_PUBLISH_ATTEMPTS {
         let suffix = random_hex()?;
         let tmp = dir.join(format!(".epocnote-tmp-{}", random_hex()?));
@@ -231,13 +256,23 @@ fn publish(root: &Path, slug: &str, bytes: &[u8], date: &str) -> Result<String, 
         }
         match fs::hard_link(&tmp, &dest) {
             Ok(()) => {
+                let path = format!(".context/notes/{dest_name}");
+                let mut warnings = Vec::new();
                 if let Err(e) = sync_dir(&dir) {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(e);
+                    warnings.push(Warning::new(
+                        "DURABILITY",
+                        Some(path.clone()),
+                        format!("note saved but the directory could not be synchronized: {e}"),
+                    ));
                 }
-                // Removing our own temporary name is best-effort cleanup.
-                let _ = fs::remove_file(&tmp);
-                return Ok(format!(".context/notes/{dest_name}"));
+                if let Err(e) = fs::remove_file(&tmp) {
+                    warnings.push(Warning::new(
+                        "CLEANUP_FAILED",
+                        Some(path.clone()),
+                        format!("note saved; could not remove its temporary file: {e}"),
+                    ));
+                }
+                return Ok((path, warnings));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&tmp);
@@ -340,11 +375,10 @@ pub fn create_note(root: &Path, index: &mut Index, input: NoteInput) -> Result<N
     let publication_hash = sync::hex_sha256(text.as_bytes());
     let slug = slug(&parsed.title);
     let date = now.format("%Y-%m-%d").to_string();
-    let path = publish(root, &slug, text.as_bytes(), &date)?;
+    let (path, mut warnings) = publish(root, &slug, text.as_bytes(), &date)?;
 
     // Publication succeeded: every later failure is a warning, saved stays
     // true (9.4). Durability and indexing warnings precede advisory ones.
-    let mut warnings = Vec::new();
     let indexed = match index_published(index, root, &path, &publication_hash) {
         Ok(v) => v,
         Err(e) => {

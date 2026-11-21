@@ -30,7 +30,26 @@ const CATCH_UP: Duration = Duration::from_secs(2);
 pub struct SearchInput {
     pub query: Option<String>,
     pub path_filter: Option<String>,
-    pub limit: Option<i64>,
+    #[serde(default, deserialize_with = "de_limit")]
+    pub limit: Limit,
+}
+
+/// Field presence is significant: `limit` absent means default, while an
+/// explicit null or non-integer value is a validation error (section 8.1).
+#[derive(Debug, Default)]
+pub enum Limit {
+    #[default]
+    Absent,
+    Invalid,
+    Value(i64),
+}
+
+fn de_limit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Limit, D::Error> {
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_i64().map(Limit::Value).unwrap_or(Limit::Invalid),
+        _ => Limit::Invalid,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -121,9 +140,9 @@ fn validate(input: SearchInput) -> Result<Parsed, Error> {
         Some(f) => Some(canon::canonicalize(f, PathSource::ToolArg)?),
     };
     let limit = match input.limit {
-        None => DEFAULT_LIMIT,
-        Some(v) if (1..=i32::MAX as i64).contains(&v) => (v as usize).min(MAX_RESULTS),
-        Some(_) => {
+        Limit::Absent => DEFAULT_LIMIT,
+        Limit::Value(v) if (1..=i32::MAX as i64).contains(&v) => (v as usize).min(MAX_RESULTS),
+        _ => {
             return Err(Error::InvalidArgument(
                 "limit must be an integer from 1 through 2147483647".into(),
             ));
@@ -192,7 +211,8 @@ fn matching_impacts(
              OR (target >= ?2 AND target < ?3)",
         );
         let mut binds: Vec<String> = vec![f.to_string(), format!("{f}/"), format!("{f}0")];
-        // Ancestor impacts: equality on each proper component prefix.
+        // Ancestor impacts: equality on each proper component prefix,
+        // including the canonical root `./`, which covers every filter.
         let mut prefix = String::new();
         for (i, comp) in f.split('/').enumerate() {
             if i > 0 {
@@ -204,6 +224,8 @@ fn matching_impacts(
                 sql.push_str(&format!(" OR target = ?{}", binds.len()));
             }
         }
+        binds.push(canon::ROOT.to_string());
+        sql.push_str(&format!(" OR target = ?{}", binds.len()));
         (sql, binds)
     };
     let mut stmt = conn.prepare(&sql).map_err(map_error)?;
@@ -407,8 +429,8 @@ fn text_retrieval(
     superseded: &HashSet<String>,
 ) -> Result<Ranked, Error> {
     let impacts = match &parsed.filter {
-        Some(f) if !f.is_root() => Some(matching_impacts(conn, f)?),
-        _ => None,
+        Some(f) => Some(matching_impacts(conn, f)?),
+        None => None,
     };
     let mut tiers: Vec<RankedDoc> = Vec::new();
     for (joiner, tier) in [(" AND ", "all"), (" OR ", "any")] {
@@ -498,7 +520,21 @@ fn build_output(
             match_tier: tier,
         });
     }
-    let (warnings, warnings_truncated) = fit_warnings(coverage.warnings.clone());
+    let mut all_warnings = coverage.warnings.clone();
+    if coverage.partial_index && coverage.remaining > 0 {
+        all_warnings.insert(
+            0,
+            Warning::new(
+                "INDEX_CATCHING_UP",
+                None,
+                format!(
+                    "index is behind the latest scan; {} document(s) remain to be reconciled",
+                    coverage.remaining
+                ),
+            ),
+        );
+    }
+    let (warnings, warnings_truncated) = fit_warnings(all_warnings);
     Ok(SearchOutput {
         truncated: ranked.eligible > results.len(),
         results,

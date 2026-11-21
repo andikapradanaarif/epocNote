@@ -312,7 +312,20 @@ fn parse_frontmatter(yaml: &str) -> Result<Vec<(String, YNode)>, String> {
                 let YNode::Map(fields) = parse_map(&mut p, 1)? else {
                     unreachable!()
                 };
-                return Ok(fields);
+                // A complete mapping does not end the frontmatter: consume
+                // through the stream end and reject any trailing content.
+                loop {
+                    match peek_yaml(&mut p)? {
+                        Some(YamlEvent::DocumentEnd) => {
+                            p.next_event();
+                        }
+                        Some(YamlEvent::StreamEnd) => return Ok(fields),
+                        Some(_) => {
+                            return Err("unexpected content after the frontmatter mapping".into());
+                        }
+                        None => return Err("unclosed YAML stream".into()),
+                    }
+                }
             }
             YamlEvent::Alias(..) => return Err("YAML aliases are not allowed".into()),
             YamlEvent::SequenceStart(..) | YamlEvent::Scalar(..) => {

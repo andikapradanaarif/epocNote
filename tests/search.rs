@@ -2,7 +2,7 @@
 
 use epocnote::db::Index;
 use epocnote::init::{Target, run_init};
-use epocnote::search::{SearchInput, SearchOutput, search};
+use epocnote::search::{Limit, SearchInput, SearchOutput, search};
 use epocnote::sync::{IndexSync, ScanReuse};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ fn q(query: &str) -> SearchInput {
     SearchInput {
         query: Some(query.into()),
         path_filter: None,
-        limit: None,
+        limit: Limit::Absent,
     }
 }
 
@@ -43,7 +43,7 @@ fn f(filter: &str) -> SearchInput {
     SearchInput {
         query: None,
         path_filter: Some(filter.into()),
-        limit: None,
+        limit: Limit::Absent,
     }
 }
 
@@ -183,7 +183,7 @@ fn validation_errors() {
         err(SearchInput {
             query: None,
             path_filter: None,
-            limit: None
+            limit: Limit::Absent
         }),
         "INVALID_ARGUMENT"
     );
@@ -196,7 +196,7 @@ fn validation_errors() {
             err(SearchInput {
                 query: Some("a".into()),
                 path_filter: None,
-                limit: Some(bad)
+                limit: Limit::Value(bad)
             }),
             "INVALID_ARGUMENT"
         );
@@ -225,7 +225,7 @@ fn limit_clamps_at_ten_and_reports_truncated() {
         SearchInput {
             query: Some("identical".into()),
             path_filter: None,
-            limit: Some(50),
+            limit: Limit::Value(50),
         },
     );
     assert_eq!(out.results.len(), 10, "limit clamps at 10");
@@ -242,4 +242,11 @@ fn empty_match_is_success_not_truncation() {
     assert!(!out.truncated);
     // created_at absent from frontmatter normalizes to null in output.
     assert!(out.results.is_empty());
+}
+
+#[test]
+fn explicit_null_limit_is_invalid() {
+    let v = serde_json::json!({"query": "x", "limit": null});
+    let input: SearchInput = serde_json::from_value(v).unwrap();
+    assert!(matches!(input.limit, Limit::Invalid));
 }

@@ -302,3 +302,23 @@ fn init_verifies_git_ignores_database() {
             .any(|w| w.code == "IGNORE_RULE_CONFLICT")
     );
 }
+
+#[test]
+fn oversized_gitignore_tail_handling() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    // 8 MiB of comment lines, no trailing newline.
+    let mut g = String::new();
+    while g.len() < 8 * 1024 * 1024 {
+        g.push_str("# filler comment line\n");
+    }
+    g.push_str("# last line without newline");
+    std::fs::write(root.join(".gitignore"), &g).unwrap();
+    run_init(Some(root), root, Target::None).unwrap();
+    let c1 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert!(c1.contains("# last line without newline\n/.context/.epocnote.sqlite*\n"));
+    run_init(Some(root), root, Target::None).unwrap();
+    let c2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+    assert_eq!(c1, c2, "second init must not duplicate entries");
+}

@@ -261,21 +261,19 @@ fn write_scaffold_file(
 fn update_gitignore(root: &Path, report: &mut InitReport) -> Result<(), Error> {
     let path = root.join(".gitignore");
     let existed = fs::symlink_metadata(&path).is_ok();
-    let (existing, oversized) = match fs::metadata(&path) {
-        Ok(md) if md.len() > GITIGNORE_READ_CAP => (String::new(), true),
-        Ok(_) => (fs::read_to_string(&path)?, false),
-        Err(e) if e.kind() == ErrorKind::NotFound => (String::new(), false),
+    // For an oversized file only the tail is inspected — enough to detect
+    // our own prior appends and the final newline without reading it all.
+    let existing = match fs::metadata(&path) {
+        Ok(md) if md.len() > GITIGNORE_READ_CAP => read_tail(&path, GITIGNORE_READ_CAP)?,
+        Ok(_) => fs::read_to_string(&path)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let missing: Vec<&str> = if oversized {
-        GITIGNORE_ENTRIES.to_vec()
-    } else {
-        GITIGNORE_ENTRIES
-            .iter()
-            .copied()
-            .filter(|entry| !existing.lines().any(|l| l.trim_end() == *entry))
-            .collect()
-    };
+    let missing: Vec<&str> = GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|entry| !existing.lines().any(|l| l.trim_end() == *entry))
+        .collect();
     if !missing.is_empty() {
         // One append-mode write: pre-existing bytes are never rewritten, and
         // concurrent initializers can only duplicate lines, not lose them.
@@ -304,6 +302,17 @@ fn update_gitignore(root: &Path, report: &mut InitReport) -> Result<(), Error> {
     }
     verify_gitignore(root, report);
     Ok(())
+}
+
+/// Read at most `cap` bytes from the end of `path`.
+fn read_tail(path: &Path, cap: u64) -> Result<String, Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::End(-(len.min(cap) as i64)))?;
+    let mut buf = Vec::new();
+    f.take(cap).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Confirm Git actually ignores the database, sidecars, and publication
