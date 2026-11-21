@@ -23,6 +23,24 @@ The tool runs as an MCP server (`epocnote serve`) exposing two tools to the
 agent harness: `epocnote_search` (path-filtered, full-text, ranked) and
 `epocnote_note` (validated, atomically published, immediately indexed).
 
+Everything runs locally: the harness spawns the binary over stdio, notes
+live in your repo, and the index is a local file. Nothing leaves the
+machine unless you push the repository.
+
+## How the agent knows to use it
+
+Two layers:
+
+1. **Tool registration.** Add `epocnote serve` to your harness's MCP
+   configuration. On startup it discovers `epocnote_search` and
+   `epocnote_note` (schemas and descriptions) through the standard
+   `tools/list` handshake, so the model *can* call them.
+2. **The skill file.** `epocnote init --target <harness>` installs a
+   `SKILL.md` the harness loads into the agent's instructions — the part
+   that tells the model *when* to call them: search before structural
+   edits, read `architecture.md` at task start, record non-obvious
+   discoveries, and treat note content as untrusted project data.
+
 ## Usage
 
 ```text
