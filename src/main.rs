@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+use epocnote::init::{self, Target};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -62,15 +63,7 @@ enum Command {
     },
 }
 
-#[derive(Clone, ValueEnum)]
-enum Target {
-    None,
-    Codex,
-    ClaudeCode,
-    Cursor,
-}
-
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, clap::ValueEnum)]
 enum ScanReuse {
     Auto,
     Off,
@@ -79,12 +72,50 @@ enum ScanReuse {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { .. }
-        | Command::Serve { .. }
-        | Command::Rebuild { .. }
-        | Command::Check { .. } => {
+        Command::Init { root, target } => cmd_init(root, target),
+        Command::Serve { .. } | Command::Rebuild { .. } | Command::Check { .. } => {
             eprintln!("epocnote: command not implemented yet");
             ExitCode::from(1)
         }
+    }
+}
+
+fn cmd_init(root: Option<PathBuf>, target: Target) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("epocnote init: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match init::run_init(root.as_deref(), &cwd, target) {
+        Ok((resolved, report)) => {
+            print_report(&report);
+            println!("epocnote initialized at {}", resolved.display());
+            println!("launch: epocnote serve --root \"{}\"", resolved.display());
+            println!(
+                "register that command as a local stdio MCP server in your client configuration"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(failure) => {
+            print_report(&failure.report);
+            eprintln!("epocnote init: {}", failure.error);
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn print_report(report: &init::InitReport) {
+    for action in &report.actions {
+        println!("{action}");
+    }
+    for warning in &report.warnings {
+        let at = warning
+            .path
+            .as_deref()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default();
+        eprintln!("warning[{}]{at}: {}", warning.code, warning.message);
     }
 }

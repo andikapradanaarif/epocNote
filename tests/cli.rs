@@ -35,19 +35,40 @@ fn help_and_version_succeed() {
 
 #[test]
 fn valid_argument_shapes_are_accepted() {
+    // init is implemented and creates real scaffolds: it runs in a temp dir.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().to_str().unwrap();
+    let out = run(&["init", "--root", root, "--target", "none"]);
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tmp.path().join(".context/architecture.md").is_file());
+    for target in ["codex", "claude-code", "cursor"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = run(&[
+            "init",
+            "--root",
+            dir.path().to_str().unwrap(),
+            "--target",
+            target,
+        ]);
+        assert!(
+            out.status.success(),
+            "init --target {target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The remaining commands are stubs: accepted arguments reach the stub
+    // and exit 1 with a diagnostic on stderr, never a usage error (exit 2).
     for args in [
-        ["init", "--root", "/tmp", "--target", "none"].as_slice(),
-        ["init", "--target", "codex"].as_slice(),
-        ["init", "--target", "claude-code"].as_slice(),
-        ["init", "--target", "cursor"].as_slice(),
         ["serve", "--root", "/tmp", "--scan-reuse", "auto"].as_slice(),
         ["serve", "--scan-reuse", "off"].as_slice(),
         ["rebuild", "--root", "/tmp"].as_slice(),
         ["check", "--strict"].as_slice(),
     ] {
         let out = run(args);
-        // Commands are not implemented yet: accepted arguments reach the stub
-        // and exit 1 with a diagnostic on stderr, never a usage error (exit 2).
         assert_eq!(
             out.status.code(),
             Some(1),

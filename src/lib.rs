@@ -2,6 +2,7 @@ pub mod advisory;
 pub mod canon;
 pub mod db;
 pub mod error;
+pub mod init;
 pub mod root;
 pub mod scan;
 
