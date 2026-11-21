@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain and components pinned in rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@master
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # The test suite creates the FTS5 schema and executes the actual bm25
+      # ranking query against the bundled SQLite on every release target
+      # (plan.md sections 1.3 and 13).
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
